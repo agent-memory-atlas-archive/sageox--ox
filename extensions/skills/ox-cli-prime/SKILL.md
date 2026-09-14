@@ -23,7 +23,7 @@ Keywords: prime, session start, guidance, team context, conventions, init sessio
 
 ### ox not found
 **Symptom:** `command not found: ox`
-**Solution:** Install ox CLI: `brew install ghostlayer/tap/ox` or see installation docs
+**Solution:** Install ox CLI: `brew install sageox/tap/ox` or see installation docs
 
 ### No guidance loaded
 **Symptom:** Prime runs but returns empty guidance

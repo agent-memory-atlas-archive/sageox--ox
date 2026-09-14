@@ -62,7 +62,7 @@ func TestHookFallbackMessage(t *testing.T) {
 					"hook in %s (matcher=%q) should echo fallback when ox missing", eventName, entry.Matcher)
 				assert.Contains(t, hook.Command, "not on PATH for non-interactive shells",
 					"fallback in %s (matcher=%q) must distinguish off-PATH from not-installed", eventName, entry.Matcher)
-				assert.Contains(t, hook.Command, "brew install ox",
+				assert.Contains(t, hook.Command, "brew install sageox/tap/ox",
 					"fallback in %s (matcher=%q) must offer a runnable install command", eventName, entry.Matcher)
 			}
 		}
@@ -559,7 +559,7 @@ func TestConstantsFallbackMessage(t *testing.T) {
 		// Branch 2 — genuinely absent. Must give a runnable install command.
 		assert.Contains(t, cmd, "ox is not installed",
 			"not-installed branch must say so plainly")
-		assert.Contains(t, cmd, "brew install ox",
+		assert.Contains(t, cmd, "brew install sageox/tap/ox",
 			"not-installed branch must offer a runnable install command")
 
 		// Terminology: user-facing copy says "AI coding tools", never "agents".
