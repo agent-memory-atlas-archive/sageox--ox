@@ -70,6 +70,8 @@ func TestOxInPathCheck_OffPath_MessageMatchesContractD3(t *testing.T) {
 	)
 }
 
+// TestOxInPathCheck_NotInstalled verifies users with and without Homebrew both
+// receive safe installation guidance when ox is absent.
 func TestOxInPathCheck_NotInstalled(t *testing.T) {
 	check := NewOxInPathCheckForTest(
 		func(string) (string, error) { return "", assertErrNotFound() },

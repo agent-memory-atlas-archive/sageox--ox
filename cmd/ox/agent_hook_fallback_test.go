@@ -80,6 +80,8 @@ func TestCheckHookCommands_AgentHookFallback(t *testing.T) {
 	assert.False(t, result.warning, "expected no warning for the off-PATH fallback text, got detail=%s", result.detail)
 }
 
+// TestOffPathFallback_DoesNotRecommendMutableInstaller verifies both generated
+// hook fallbacks offer safe release routes without mutable installer guidance.
 func TestOffPathFallback_DoesNotRecommendMutableInstaller(t *testing.T) {
 	fallbacks := map[string]string{
 		"agent hook": constants.OxPrimeCommandClaudeCode,
