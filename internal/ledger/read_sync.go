@@ -520,10 +520,7 @@ func hydrateReadFiles(ctx context.Context, transport *gitserver.ReadTransport, d
 			if f.ref.BareOID() != lfs.ComputeOID(nil) {
 				return errors.New("missing_hydration")
 			}
-			// Truncating the pointer in place is already atomic for zero bytes; a crash
-			// mid-way leaves either the pointer or the empty file, both of which the
-			// next sync handles.
-			if err := os.WriteFile(filepath.Join(dir, f.path), nil, 0o600); err != nil {
+			if err := materializeEmptyReadObject(filepath.Join(dir, f.path)); err != nil {
 				return err
 			}
 			continue
@@ -604,6 +601,24 @@ func materializeReadObject(ctx context.Context, action *lfs.Action, path string,
 	if err != nil || info.Size() != ref.Size {
 		return errors.New("missing_hydration")
 	}
+	return commitReadObject(f, path)
+}
+
+// materializeEmptyReadObject replaces a size-0 pointer with the empty file it
+// describes, through the same durable path as a downloaded object, so a ready
+// receipt never covers a replacement that a crash could roll back to the pointer.
+func materializeEmptyReadObject(path string) error {
+	f, err := os.CreateTemp(filepath.Dir(path), ".ox-read-object-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+	defer f.Close()
+	return commitReadObject(f, path)
+}
+
+// commitReadObject makes the fully written temp file f durable at path.
+func commitReadObject(f *os.File, path string) error {
 	if err := f.Sync(); err != nil {
 		return err
 	}
