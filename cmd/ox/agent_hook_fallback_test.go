@@ -89,6 +89,7 @@ func TestOffPathFallback_DoesNotRecommendMutableInstaller(t *testing.T) {
 	for name, fallback := range fallbacks {
 		t.Run(name, func(t *testing.T) {
 			assert.Contains(t, fallback, "brew install sageox/tap/ox")
+			assert.Contains(t, fallback, "github.com/sageox/ox/releases/latest")
 			assert.NotContains(t, fallback, "curl")
 			assert.NotContains(t, fallback, "github.com/sageox/ox#install")
 		})

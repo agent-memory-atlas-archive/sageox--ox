@@ -64,6 +64,8 @@ func TestHookFallbackMessage(t *testing.T) {
 					"fallback in %s (matcher=%q) must distinguish off-PATH from not-installed", eventName, entry.Matcher)
 				assert.Contains(t, hook.Command, "brew install sageox/tap/ox",
 					"fallback in %s (matcher=%q) must offer a runnable install command", eventName, entry.Matcher)
+				assert.Contains(t, hook.Command, "github.com/sageox/ox/releases/latest",
+					"fallback in %s (matcher=%q) must support users without Homebrew", eventName, entry.Matcher)
 				assert.NotContains(t, hook.Command, "github.com/sageox/ox#install",
 					"fallback in %s (matcher=%q) must not link to mutable installer guidance", eventName, entry.Matcher)
 				assert.NotContains(t, hook.Command, "curl",

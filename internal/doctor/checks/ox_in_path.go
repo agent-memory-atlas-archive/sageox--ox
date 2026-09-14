@@ -177,14 +177,15 @@ func (c *OxInPathCheck) Run(ctx context.Context, _ bool) doctor.CheckResult {
 	}
 }
 
-// notInstalledFixText points at the official, self-updating install route
+// notInstalledFixText points at the official install routes
 // rather than `go install`/`make install`, which do not track releases.
 // The brew formula must stay fully qualified: homebrew-core ships an
 // unrelated `ox` (a Rust text editor) and core wins every bare-name lookup,
 // so `brew install ox` installs that instead, tap or no tap. Do not link the
 // README here: it recommends a `curl … | bash` installer fetched from a
 // mutable branch (issue #937).
-const notInstalledFixText = "brew install sageox/tap/ox        # recommended"
+const notInstalledFixText = "brew install sageox/tap/ox        # recommended\n" +
+	"Download a release: https://github.com/sageox/ox/releases/latest"
 
 // nonZshRestartLine is required by contract D15: non-interactive,
 // non-login bash sources nothing by default (not ~/.bashrc, not
