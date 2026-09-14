@@ -176,6 +176,17 @@ diff --git a/deleted.go b/deleted.go
                 "package live\n\nfunc Run() error { return nil }\n",
                 encoding="utf-8",
             )
+            # Go permits whitespace before a top-level declaration, and a
+            # package-level func literal is a coverable body with no `func`
+            # at line start. Neither may be mistaken for declaration-only.
+            (root / "internal/live/indented.go").write_text(
+                "package live\n\n  func Indented() {}\n",
+                encoding="utf-8",
+            )
+            (root / "internal/live/literal.go").write_text(
+                "package live\n\nvar Handler = func() {}\n",
+                encoding="utf-8",
+            )
             settings = {"minimum": 90, "excluded_paths": [], "exceptions": []}
 
             with mock.patch("coverage_ratchet.Path", side_effect=lambda p: root / p):
@@ -184,6 +195,8 @@ diff --git a/deleted.go b/deleted.go
                     {
                         "internal/constants/agent.go": {3},
                         "internal/live/run.go": {3},
+                        "internal/live/indented.go": {3},
+                        "internal/live/literal.go": {3},
                     },
                     settings,
                 )
@@ -194,7 +207,11 @@ diff --git a/deleted.go b/deleted.go
             notices,
         )
         self.assertEqual(
-            ["internal/live/run.go: changed production file has no coverage data"],
+            [
+                "internal/live/indented.go: changed production file has no coverage data",
+                "internal/live/literal.go: changed production file has no coverage data",
+                "internal/live/run.go: changed production file has no coverage data",
+            ],
             failures,
         )
 

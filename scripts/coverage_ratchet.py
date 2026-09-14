@@ -346,23 +346,24 @@ def path_matches(path: str, patterns: list[str]) -> bool:
 
 
 def declares_no_functions(path: str) -> bool | None:
-    """Whether a Go file declares no functions, and so can never be profiled.
+    """Whether a Go file has no `func` keyword, and so can never be profiled.
 
-    `go tool cover` instruments function bodies only, so a declaration-only
-    file (constants, vars, embeds, a bare doc.go) contributes zero blocks no
-    matter how thoroughly its package is exercised. Returns None when the file
-    cannot be read, leaving the caller on its package-level fallback.
+    `go tool cover` instruments function bodies only -- declarations and
+    literals alike -- and every one of them is introduced by `func`. A file
+    without that keyword (constants, vars, embeds, a bare doc.go) contributes
+    zero blocks no matter how thoroughly its package is exercised. Returns None
+    when the file cannot be read, leaving the caller on its package fallback.
 
-    Only a `func` at column 0 counts. gofmt -- enforced by this repo's
-    pre-commit hooks -- puts every top-level declaration there, so the check
-    cannot miss a real function; a `func ` opening a line inside a raw string
-    reads as a function here and merely keeps the stricter existing behavior.
+    The keyword is matched anywhere, not just at column 0: Go permits indented
+    top-level declarations, and `var h = func() {}` is a coverable body with no
+    `func` at line start. A `func` inside a comment or string reads as a
+    function here and merely keeps the stricter existing behavior.
     """
     try:
         source = Path(path).read_text(encoding="utf-8")
     except OSError:
         return None
-    return not any(line.startswith("func ") for line in source.splitlines())
+    return re.search(r"\bfunc\b", source) is None
 
 
 def validate_exceptions(
