@@ -90,9 +90,9 @@ install: install-ox install-adapters ## Install ox and adapters to $GOPATH/bin
 	@echo "  For everyday use, install a release instead:"
 	@echo ""
 	@echo "    brew install sageox/tap/ox        # recommended"
-	@echo "    curl -sSL https://raw.githubusercontent.com/sageox/ox/main/scripts/install.sh | bash"
+	@echo "    Other install routes: https://github.com/sageox/ox#install"
 	@echo ""
-	@echo "  Both self-update via \`ox upgrade\` and keep ox and its 10 adapter"
+	@echo "  Releases self-update via \`ox upgrade\` and keep ox and its 10 adapter"
 	@echo "  binaries together on PATH."
 	@echo "─────────────────────────────────────────────────────────────────────"
 	@case ":$$PATH:" in \
