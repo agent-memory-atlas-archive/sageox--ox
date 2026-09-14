@@ -80,6 +80,21 @@ func TestCheckHookCommands_AgentHookFallback(t *testing.T) {
 	assert.False(t, result.warning, "expected no warning for the off-PATH fallback text, got detail=%s", result.detail)
 }
 
+func TestOffPathFallback_DoesNotRecommendMutableInstaller(t *testing.T) {
+	fallbacks := map[string]string{
+		"agent hook": constants.OxPrimeCommandClaudeCode,
+		"git hook":   oxGitHookNotOnPathFallback,
+	}
+
+	for name, fallback := range fallbacks {
+		t.Run(name, func(t *testing.T) {
+			assert.Contains(t, fallback, "brew install sageox/tap/ox")
+			assert.NotContains(t, fallback, "curl")
+			assert.NotContains(t, fallback, "github.com/sageox/ox#install")
+		})
+	}
+}
+
 // TestOffPathFallback_FishRecoveryLineSurvivesSpaces runs both off-PATH
 // fallbacks under a fish $SHELL with ox installed in a directory containing a
 // space. The zsh/bash branches interpolate inside `export PATH="..."`, so a

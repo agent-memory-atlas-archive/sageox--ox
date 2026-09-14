@@ -146,7 +146,7 @@ if command -v ox >/dev/null 2>&1; then
         ;;
     esac
   else
-    echo "ox is not installed. Install a release: brew install sageox/tap/ox, or see https://github.com/sageox/ox#install" >&2
+    echo "ox is not installed. Install a release: brew install sageox/tap/ox" >&2
   fi
 fi`
 )
