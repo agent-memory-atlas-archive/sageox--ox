@@ -80,7 +80,7 @@ func TestOxInPathCheck_NotInstalled(t *testing.T) {
 
 	assert.Equal(t, doctor.StatusWarn, result.Status)
 	assert.Equal(t, "ox is not installed", result.Message)
-	assert.Contains(t, result.Fix, "brew tap sageox/tap")
+	assert.Contains(t, result.Fix, "brew install sageox/tap/ox")
 }
 
 func TestOxInPathCheck_Pass_WhenShellAgreesWithRunningBinary(t *testing.T) {

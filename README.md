@@ -44,8 +44,7 @@ recorded to your team's shared, queryable history.
 **Homebrew (macOS / Linux):**
 
 ```bash
-brew tap sageox/tap
-brew install ox
+brew install sageox/tap/ox
 ```
 
 **Install script (macOS / Linux / FreeBSD):**

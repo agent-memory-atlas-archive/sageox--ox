@@ -143,7 +143,7 @@ if command -v ox >/dev/null 2>&1; then
         ;;
     esac
   else
-    echo "ox is not installed. Install a release: brew tap sageox/tap && brew install ox, or curl -sSL https://raw.githubusercontent.com/sageox/ox/main/scripts/install.sh | bash" >&2
+    echo "ox is not installed. Install a release: brew install sageox/tap/ox, or curl -sSL https://raw.githubusercontent.com/sageox/ox/main/scripts/install.sh | bash" >&2
   fi
 fi`
 )
