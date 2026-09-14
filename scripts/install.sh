@@ -59,8 +59,10 @@ log_error() {
 # export to the interactive rc file and then restarting the tool from a
 # fresh terminal works, even though the file itself is never read directly
 # by the hook shell. Mirrors internal/constants/agent.go's
-# oxNotOnPathFallback and internal/doctor/checks/ox_in_path.go's
-# explanationFor/shellRCFor — keep the wording identical across all three.
+# oxNotOnPathFallback, cmd/ox/hooks_git.go's
+# oxGitHookNotOnPathFallback, internal/doctor/checks/ox_in_path.go's
+# explanationFor/shellRCFor, and the Makefile's install target — keep the
+# wording identical across all five.
 print_path_warning() {
     local binary_path=$1
     local install_dir
@@ -90,7 +92,7 @@ print_path_warning() {
             ;;
         fish)
             rc_file="~/.config/fish/config.fish"
-            path_line="fish_add_path $install_dir"
+            path_line="fish_add_path -- \"$install_dir\""
             restart_line="Then restart your AI coding tool from a new terminal so it picks up the change."
             explanation="AI coding tools inherit the environment of the terminal they were started from, not any change made after they launched."
             ;;

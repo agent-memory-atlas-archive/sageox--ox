@@ -178,9 +178,12 @@ func (c *OxInPathCheck) Run(ctx context.Context, _ bool) doctor.CheckResult {
 }
 
 // notInstalledFixText points at the official, self-updating install routes
-// rather than `go install`/`make install`, which do not track releases.
+// rather than `go install`/`make install`, which do not track releases. It
+// links the README instead of spelling out the `curl … | bash` one-liner:
+// that fetches from a mutable branch, and the installer's own checksum
+// verification cannot cover the fetch of the installer (issue #937).
 const notInstalledFixText = "brew tap sageox/tap && brew install ox        # recommended\n" +
-	"curl -sSL https://raw.githubusercontent.com/sageox/ox/main/scripts/install.sh | bash"
+	"Other install routes: https://github.com/sageox/ox#install"
 
 // nonZshRestartLine is required by contract D15: non-interactive,
 // non-login bash sources nothing by default (not ~/.bashrc, not
@@ -243,7 +246,7 @@ func shellRCFor(kind shellKind) shellRCFile {
 	case shellFish:
 		return shellRCFile{
 			file: "~/.config/fish/config.fish",
-			line: func(dir string) string { return fmt.Sprintf("fish_add_path %s", dir) },
+			line: func(dir string) string { return fmt.Sprintf(`fish_add_path -- "%s"`, dir) },
 		}
 	default:
 		return shellRCFile{file: "your shell's startup file", line: exportLine}

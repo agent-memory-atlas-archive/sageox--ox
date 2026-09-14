@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 
@@ -77,4 +78,45 @@ func TestCheckHookCommands_AgentHookFallback(t *testing.T) {
 
 	assert.True(t, result.passed, "expected passed result, got passed=%v warning=%v detail=%s", result.passed, result.warning, result.detail)
 	assert.False(t, result.warning, "expected no warning for the off-PATH fallback text, got detail=%s", result.detail)
+}
+
+// TestOffPathFallback_FishRecoveryLineSurvivesSpaces runs both off-PATH
+// fallbacks under a fish $SHELL with ox installed in a directory containing a
+// space. The zsh/bash branches interpolate inside `export PATH="..."`, so a
+// spaced directory survives being copied; the fish branch emitted the
+// directory bare, so fish received three arguments and added two wrong
+// directories — the one recovery instruction an off-PATH user is given
+// silently failed for exactly the user who needed it. Drives `sh` rather than
+// asserting on the constant so the shell's own quoting is what's tested.
+func TestOffPathFallback_FishRecoveryLineSurvivesSpaces(t *testing.T) {
+	binDir := filepath.Join(t.TempDir(), "Go Tools", "bin")
+	require.NoError(t, os.MkdirAll(binDir, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(binDir, "ox"), []byte("#!/bin/sh\n"), 0755))
+
+	cases := []struct {
+		name   string
+		script string
+	}{
+		{"agent hook", constants.OxPrimeCommandClaudeCode},
+		// The git-hook fallback is an else-branch; give it the `if` it expects.
+		{"git hook", "if command -v ox >/dev/null 2>&1; then :\n" + oxGitHookNotOnPathFallback},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := exec.Command("sh", "-c", tc.script)
+			cmd.Env = []string{
+				// no ox on PATH: this is the branch under test
+				"PATH=/usr/bin:/bin",
+				"HOME=" + t.TempDir(),
+				"GOBIN=" + binDir,
+				"SHELL=/usr/bin/fish",
+			}
+			out, err := cmd.CombinedOutput()
+			require.NoError(t, err, "fallback exited non-zero: %s", out)
+
+			assert.Contains(t, string(out), `fish_add_path -- "`+binDir+`"`,
+				"fish recovery line must pass the install directory to fish as one argument, got:\n%s", out)
+		})
+	}
 }

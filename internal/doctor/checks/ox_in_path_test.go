@@ -139,7 +139,7 @@ func TestOxInPathCheck_OffPathFixText_PerShell(t *testing.T) {
 	}{
 		{"zsh", shellZsh, "~/.zshenv", `export PATH="$PATH:/some/dir"`, false},
 		{"bash", shellBash, "~/.bashrc", `export PATH="$PATH:/some/dir"`, true},
-		{"fish", shellFish, "~/.config/fish/config.fish", "fish_add_path /some/dir", true},
+		{"fish", shellFish, "~/.config/fish/config.fish", `fish_add_path -- "/some/dir"`, true},
 		{"unknown", shellUnknown, "your shell's startup file", `export PATH="$PATH:/some/dir"`, true},
 	}
 	for _, tt := range tests {

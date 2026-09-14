@@ -92,7 +92,10 @@ if command -v ox >/dev/null 2>&1; then
 	// internal/constants/agent.go's oxNotOnPathFallback (the AI-tool-hook
 	// flavor of this same message) and
 	// internal/doctor/checks/ox_in_path.go's explanationFor/shellRCFor —
-	// keep the three wordings identical.
+	// keep these wordings identical. The same per-shell copy also lives in
+	// scripts/install.sh's print_path_warning and the Makefile's install
+	// target; a fix to one (e.g. the fish quoting in #937) belongs in all
+	// five.
 	//
 	// Uses `_ox_p`/`_ox_gp` (not `p`/`gp`): installHookSection appends this
 	// section into an existing hook file's shell scope, where plain
@@ -132,7 +135,7 @@ if command -v ox >/dev/null 2>&1; then
       fish)
         echo "AI coding tools inherit the environment of the terminal they were started from, not any change made after they launched." >&2
         echo "Add this line to ~/.config/fish/config.fish:" >&2
-        echo "    fish_add_path $_ox_p" >&2
+        echo "    fish_add_path -- \"$_ox_p\"" >&2
         echo "Then restart your AI coding tool from a new terminal so it picks up the change." >&2
         ;;
       *)
@@ -143,7 +146,7 @@ if command -v ox >/dev/null 2>&1; then
         ;;
     esac
   else
-    echo "ox is not installed. Install a release: brew tap sageox/tap && brew install ox, or curl -sSL https://raw.githubusercontent.com/sageox/ox/main/scripts/install.sh | bash" >&2
+    echo "ox is not installed. Install a release: brew tap sageox/tap && brew install ox, or see https://github.com/sageox/ox#install" >&2
   fi
 fi`
 )
