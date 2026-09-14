@@ -70,6 +70,7 @@ func TestParsePointerErrors(t *testing.T) {
 		{"missing oid", "version https://git-lfs.github.com/spec/v1\nsize 100\n"},
 		{"missing size", "version https://git-lfs.github.com/spec/v1\noid sha256:abc\n"},
 		{"bad size", "version https://git-lfs.github.com/spec/v1\noid sha256:abc\nsize notanumber\n"},
+		{"negative size", "version https://git-lfs.github.com/spec/v1\noid sha256:abc\nsize -1\n"},
 		{"too few lines", "version https://git-lfs.github.com/spec/v1\n"},
 	}
 
@@ -81,6 +82,15 @@ func TestParsePointerErrors(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Failure prevented: a zero-byte artifact's pointer (size 0) was rejected as
+// malformed, which made one empty session file fail a whole ledger read.
+func TestParsePointer_ZeroSizeIsAPointer(t *testing.T) {
+	oid, size, err := ParsePointer(FormatPointer("sha256:"+ComputeOID(nil), 0))
+	require.NoError(t, err)
+	assert.Equal(t, "sha256:"+ComputeOID(nil), oid)
+	assert.Equal(t, int64(0), size)
 }
 
 // --- File I/O layer tests ---

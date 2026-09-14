@@ -513,6 +513,21 @@ func hydrateReadFiles(ctx context.Context, transport *gitserver.ReadTransport, d
 		if len(f.pointer) == 0 || f.hydrated {
 			continue
 		}
+		if f.ref.Size == 0 {
+			// An empty object's content is fully implied by its pointer, and GitLab
+			// may never have stored it, so never spend a grant on it: verify the OID is
+			// the empty-content hash and materialize the empty file locally.
+			if f.ref.BareOID() != lfs.ComputeOID(nil) {
+				return errors.New("missing_hydration")
+			}
+			// Truncating the pointer in place is already atomic for zero bytes; a crash
+			// mid-way leaves either the pointer or the empty file, both of which the
+			// next sync handles.
+			if err := os.WriteFile(filepath.Join(dir, f.path), nil, 0o600); err != nil {
+				return err
+			}
+			continue
+		}
 		oid := f.ref.BareOID()
 		if same := pending[oid]; len(same) != 0 {
 			if same[0].ref.Size != f.ref.Size {

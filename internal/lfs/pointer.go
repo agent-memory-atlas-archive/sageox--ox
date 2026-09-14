@@ -44,6 +44,7 @@ func ParsePointer(content string) (oid string, size int64, err error) {
 		return "", 0, fmt.Errorf("not an LFS pointer: missing version line")
 	}
 
+	sawSize := false
 	for _, line := range lines[1:] {
 		switch {
 		case strings.HasPrefix(line, "oid "):
@@ -52,13 +53,17 @@ func ParsePointer(content string) (oid string, size int64, err error) {
 			if _, err := fmt.Sscanf(line, "size %d", &size); err != nil {
 				return "", 0, fmt.Errorf("parse size: %w", err)
 			}
+			sawSize = true
 		}
 	}
 
 	if oid == "" {
 		return "", 0, fmt.Errorf("not an LFS pointer: missing oid")
 	}
-	if size <= 0 {
+	// size 0 is a real pointer: an empty artifact (an unwritten context-trace.jsonl)
+	// is tracked like any other, and rejecting it made one empty file fail a whole
+	// ledger read. Only an absent or negative size is malformed.
+	if !sawSize || size < 0 {
 		return "", 0, fmt.Errorf("not an LFS pointer: missing or invalid size")
 	}
 
