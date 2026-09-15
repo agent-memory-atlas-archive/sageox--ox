@@ -36,6 +36,7 @@ type hostedReaderFixture struct {
 	path        string
 	sessionName string
 	now         time.Time
+	corruptHour time.Time
 }
 
 // runOxInProc runs one shipped command through the real root hooks, so a reader
@@ -123,11 +124,16 @@ func newHostedReaderFixture(t *testing.T) *hostedReaderFixture {
 		EntryCount:  2,
 	})
 	require.NoError(t, err)
+	// A malformed murmur, committed so it is part of the verified checkout
+	// rather than a local edit the guard would refuse as dirty. Parked three
+	// hours back so only the test that asks for that hour ever scans it.
+	corruptHour := now.Add(-3 * time.Hour)
 	files := map[string]string{
-		filepath.Join("sessions", session, "meta.json"):             string(meta),
-		filepath.Join("sessions", session, "raw.jsonl"):             "{\"type\":\"user\"}\n{\"type\":\"assistant\"}\n",
-		filepath.Join("data", "plans", "p1", "plan.md"):             "# plan\n",
-		filepath.Join(ledger.MurmurDateHourDir(now), "mur_01.json"): string(murmur),
+		filepath.Join("sessions", session, "meta.json"):                     string(meta),
+		filepath.Join("sessions", session, "raw.jsonl"):                     "{\"type\":\"user\"}\n{\"type\":\"assistant\"}\n",
+		filepath.Join("data", "plans", "p1", "plan.md"):                     "# plan\n",
+		filepath.Join(ledger.MurmurDateHourDir(now), "mur_01.json"):         string(murmur),
+		filepath.Join(ledger.MurmurDateHourDir(corruptHour), "bad_01.json"): "{not json",
 	}
 	for name, body := range files {
 		require.NoError(t, os.MkdirAll(filepath.Dir(filepath.Join(source, name)), 0700))
@@ -200,7 +206,7 @@ func newHostedReaderFixture(t *testing.T) *hostedReaderFixture {
 	synced, _, err := runReadSyncInProc(t, "--read-only", "--repo", readSyncTestRepoID, "--timeout", "2m", "--json")
 	require.NoError(t, err)
 	require.True(t, synced.Ready, "%+v", synced)
-	return &hostedReaderFixture{path: synced.Path, sessionName: session, now: now}
+	return &hostedReaderFixture{path: synced.Path, sessionName: session, now: now, corruptHour: corruptHour}
 }
 
 // Failure prevented: a hosted caller with no source checkout cannot read the
@@ -380,6 +386,9 @@ func TestHostedLedgerSelection(t *testing.T) {
 		{"http", "http://sageox.ai", t.TempDir(), "invalid_arguments"},
 		{"path", "https://sageox.ai/other", t.TempDir(), "invalid_arguments"},
 		{"relative data home", "https://sageox.ai", "relative", "invalid_arguments"},
+		{"query", "https://sageox.ai?token=secret", t.TempDir(), "invalid_arguments"},
+		{"fragment", "https://sageox.ai#secret", t.TempDir(), "invalid_arguments"},
+		{"no host", "https:///ledger", t.TempDir(), "invalid_arguments"},
 		{"accepted", "https://sageox.ai", t.TempDir(), ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -390,6 +399,28 @@ func TestHostedLedgerSelection(t *testing.T) {
 			require.NotContains(t, path, "secret")
 		})
 	}
+
+	// The legacy path override moves the checkout out from under the data home
+	// the caller selected, which is the whole isolation contract.
+	t.Run("legacy override", func(t *testing.T) {
+		t.Setenv("SAGEOX_ENDPOINT", "https://sageox.ai")
+		t.Setenv("XDG_DATA_HOME", t.TempDir())
+		t.Setenv("OX_XDG_DISABLE", "1")
+		_, _, class := selectHostedLedger(readSyncTestRepoID)
+		require.Equal(t, "invalid_arguments", class)
+	})
+
+	// A value that is not a canonical repo ID never reaches path resolution.
+	t.Run("not a repo id", func(t *testing.T) {
+		t.Setenv("SAGEOX_ENDPOINT", "https://sageox.ai")
+		t.Setenv("XDG_DATA_HOME", t.TempDir())
+		for _, bad := range []string{"", "../../secret", "repo_not-a-uuid", "/path/to/repo"} {
+			path, ep, class := selectHostedLedger(bad)
+			require.Equal(t, "invalid_arguments", class, bad)
+			require.Empty(t, path)
+			require.Empty(t, ep)
+		}
+	})
 
 	for _, tc := range []struct {
 		args []string
@@ -448,4 +479,171 @@ func TestOnlySessionListAmongListCommandsTakesARepoFlag(t *testing.T) {
 	}
 	walk(rootCmd)
 	require.Equal(t, []string{sessionListCmd.CommandPath()}, found)
+}
+
+// Failure prevented: a window with nothing in it renders as null arrays a
+// consumer has to special-case, or — worse — as the same shape a failed harvest
+// would produce. An honest empty window is a real answer and must look like one.
+func TestHostedGlanceReportsAnEmptyWindowHonestly(t *testing.T) {
+	f := newHostedReaderFixture(t)
+	quiet := f.now.Add(-30 * 24 * time.Hour)
+
+	stdout, stderr, err := runOxInProc(t, glanceCmd, "--repo", readSyncTestRepoID,
+		"--since", quiet.Format(time.RFC3339), "--until", quiet.Add(time.Hour).Format(time.RFC3339))
+	require.NoError(t, err, stderr)
+
+	var activity glance.ActivityData
+	require.NoError(t, json.Unmarshal([]byte(stdout), &activity), stdout)
+	require.Equal(t, readSyncTestRepoID, activity.Repo)
+	require.Equal(t, 0, activity.Stats.TotalMurmurs)
+	require.Equal(t, 0, activity.Stats.TotalSessions)
+	// Not null: the arrays are part of the schema whether or not they have
+	// members, and a consumer decoding them must not have to branch.
+	require.NotNil(t, activity.Authors)
+	require.NotNil(t, activity.Conflicts)
+	require.NotNil(t, activity.Overlap)
+	require.Empty(t, activity.Authors)
+}
+
+// Failure prevented: an unreadable murmur is skipped and the window comes back
+// looking quiet. Under-reporting activity is worse than failing: a coworker
+// reads "nobody touched this" and goes ahead.
+func TestHostedGlanceFailsOnUnreadableActivity(t *testing.T) {
+	f := newHostedReaderFixture(t)
+
+	stdout, stderr, err := runOxInProc(t, glanceCmd, "--repo", readSyncTestRepoID,
+		"--since", f.corruptHour.Format(time.RFC3339),
+		"--until", f.corruptHour.Add(30*time.Minute).Format(time.RFC3339))
+	require.Equal(t, 1, exitCodeOf(t, err))
+	require.Empty(t, stdout, "a failed harvest must not render as a quiet window")
+	require.Equal(t, "Ledger read failed: unavailable\n", stderr)
+}
+
+// Failure prevented: the project-scoped `ox glance` path regressed while the
+// hosted one was added. It had no test at all before the harvest/analyze body
+// moved into glanceActivity, so nothing held its behavior in place.
+func TestProjectGlanceStillReportsItsOwnLedger(t *testing.T) {
+	projectRoot, ledgerPath := setupLedgerProject(t)
+	t.Chdir(projectRoot)
+
+	now := time.Now().UTC()
+	body, err := json.Marshal(ledger.MurmurFile{
+		SchemaVersion: "1",
+		ID:            "mur_project",
+		Timestamp:     now,
+		AgentID:       "Ox0002",
+		PrincipalID:   "avery",
+		Topic:         "wip",
+		Importance:    "normal",
+		Content:       "project-scoped glance",
+	})
+	require.NoError(t, err)
+	dir := filepath.Join(ledgerPath, ledger.MurmurDateHourDir(now))
+	require.NoError(t, os.MkdirAll(dir, 0700))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "mur_project.json"), body, 0600))
+
+	stdout, stderr, err := runOxInProc(t, glanceCmd,
+		"--since", now.Add(-time.Hour).Format(time.RFC3339),
+		"--until", now.Add(time.Hour).Format(time.RFC3339))
+	require.NoError(t, err, stderr)
+
+	var activity glance.ActivityData
+	require.NoError(t, json.Unmarshal([]byte(stdout), &activity), stdout)
+	require.Equal(t, filepath.Base(projectRoot), activity.Repo, "project reads label by directory, not repo ID")
+	require.Equal(t, 1, activity.Stats.TotalMurmurs)
+
+	// Reading advances the checkpoint, so a later bare invocation resumes from
+	// here. The hosted path deliberately does not do this.
+	require.False(t, glance.GetSince(ledgerPath).Before(now), "MarkRead must advance the checkpoint")
+
+	// A malformed window is rejected before the ledger is consulted.
+	_, _, err = runOxInProc(t, glanceCmd, "--since", "not-a-window")
+	require.Error(t, err)
+	_, _, err = runOxInProc(t, glanceCmd, "--until", "not-a-window")
+	require.Error(t, err)
+
+	// The default invocation resolves its own window from the checkpoint the
+	// read above advanced, so it reports nothing new rather than replaying.
+	stdout, stderr, err = runOxInProc(t, glanceCmd)
+	require.NoError(t, err, stderr)
+	require.NoError(t, json.Unmarshal([]byte(stdout), &activity), stdout)
+	require.Equal(t, 0, activity.Stats.TotalMurmurs)
+}
+
+// Failure prevented: a project read that cannot see its activity reports a
+// quiet ledger instead of failing. Each of these is a different way the ledger
+// is unreadable, and every one of them must be louder than "nothing happened".
+func TestProjectGlanceFailsRatherThanUnderReport(t *testing.T) {
+	now := time.Now().UTC()
+	for _, tc := range []struct {
+		name   string
+		break_ func(t *testing.T, ledgerPath string)
+	}{
+		{"no ledger on disk", func(t *testing.T, ledgerPath string) {
+			require.NoError(t, os.RemoveAll(ledgerPath))
+		}},
+		{"unreadable murmur", func(t *testing.T, ledgerPath string) {
+			dir := filepath.Join(ledgerPath, ledger.MurmurDateHourDir(now))
+			require.NoError(t, os.MkdirAll(dir, 0700))
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "bad.json"), []byte("{not json"), 0600))
+		}},
+		{"sessions is not a directory", func(t *testing.T, ledgerPath string) {
+			// A regular file where a directory belongs fails on every platform,
+			// unlike a chmod, and is what a bad extraction actually leaves behind.
+			require.NoError(t, os.WriteFile(filepath.Join(ledgerPath, "sessions"), []byte("x"), 0600))
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			projectRoot, ledgerPath := setupLedgerProject(t)
+			t.Chdir(projectRoot)
+			tc.break_(t, ledgerPath)
+
+			stdout, _, err := runOxInProc(t, glanceCmd,
+				"--since", now.Add(-time.Hour).Format(time.RFC3339),
+				"--until", now.Add(time.Hour).Format(time.RFC3339))
+			require.Error(t, err)
+			require.Empty(t, stdout, "a failed harvest must not render as a quiet ledger")
+		})
+	}
+}
+
+// Failure prevented: a reader accepts an endpoint or data home that `ox sync
+// --read-only` refuses, so the selection rules diverge between the command that
+// writes the checkout and the commands that read it.
+func TestHostedReadersRefuseTheSameUnsafeSelection(t *testing.T) {
+	t.Setenv("SAGEOX_TOKEN", "")
+	t.Setenv("OX_XDG_DISABLE", "")
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	t.Setenv("SAGEOX_ENDPOINT", "http://sageox.ai") // not HTTPS
+
+	for _, tc := range []struct {
+		name string
+		cmd  *cobra.Command
+		args []string
+	}{
+		{"session list", sessionListCmd, []string{"--repo", readSyncTestRepoID, "--json"}},
+		{"glance", glanceCmd, []string{"--repo", readSyncTestRepoID}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stdout, stderr, err := runOxInProc(t, tc.cmd, tc.args...)
+			require.Equal(t, 2, exitCodeOf(t, err), "unsafe selection is an invocation error, not a read failure")
+			require.Empty(t, stdout)
+			require.Equal(t, "Ledger read failed: invalid_arguments\n", stderr)
+		})
+	}
+}
+
+// Failure prevented: a reader whose flags fail to parse emits the sync
+// command's receipt JSON, which a consumer would decode as a plausible — and
+// wrong — result for the command it actually ran.
+func TestReaderParseFailureDoesNotEmitASyncReceipt(t *testing.T) {
+	var out, errOut bytes.Buffer
+	cmd := &cobra.Command{}
+	cmd.SetOut(&out)
+	cmd.SetErr(&errOut)
+
+	args := []string{"session", "list", "--repo", readSyncTestRepoID, "--bogus", "--json"}
+	require.Equal(t, 2, writeReadSyncUsageError(cmd, args))
+	require.Empty(t, out.String(), "stdout must stay empty; a receipt here decodes as a session list that failed open")
+	require.Equal(t, "Ledger read failed: invalid_arguments\n", errOut.String())
 }
