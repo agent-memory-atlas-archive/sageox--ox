@@ -317,6 +317,7 @@ func TestReadSyncLFSBatchRejectsInvalidResponsesBeforeMaterialization(t *testing
 		{"wrong size", ReadFailureDetail{Reason: "object_size_mismatch", Path: secondPath, OID: secondOID,
 			ExpectedSize: readSize(secondSize), ActualSize: readSize(secondSize + 1)}},
 		{"missing action", ReadFailureDetail{Reason: "object_missing_actions", Path: secondPath, OID: secondOID}},
+		{"empty actions", ReadFailureDetail{Reason: "object_missing_download_action", Path: secondPath, OID: secondOID}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var batches, downloads atomic.Int32
@@ -356,6 +357,8 @@ func TestReadSyncLFSBatchRejectsInvalidResponsesBeforeMaterialization(t *testing
 					objects[1].Size++
 				case "missing action":
 					objects[1].Actions = nil
+				case "empty actions":
+					objects[1].Actions = &lfs.Actions{}
 				}
 				json.NewEncoder(w).Encode(lfs.BatchResponse{Objects: objects})
 			})
@@ -384,6 +387,48 @@ func TestReadSyncLFSBatchRejectsInvalidResponsesBeforeMaterialization(t *testing
 			require.False(t, CheckReadiness(context.Background(), f.opts.Path, f.opts.RepoID, f.opts.Endpoint).Ready)
 		})
 	}
+}
+
+// Failure prevented: a server-controlled or pointer-supplied identifier is
+// republished verbatim in error_detail, turning a diagnostic field into a
+// channel for credentials and arbitrary bytes.
+func TestSafeReadOIDAcceptsOnlyCanonicalIdentifiers(t *testing.T) {
+	canonical := lfs.ComputeOID([]byte("canonical object"))
+	require.Equal(t, canonical, safeReadOID(canonical))
+	for _, rejected := range []string{
+		"",
+		"sha256:" + canonical,
+		strings.ToUpper(canonical),
+		strings.Repeat("z", 64),
+		canonical[:63],
+		canonical + "0",
+		"https://ox:oxt_test_1ljPfr@ledger.invalid/repo.git",
+	} {
+		require.Empty(t, safeReadOID(rejected), "%q must not reach a result", rejected)
+	}
+}
+
+// Failure prevented: two files naming one object at different sizes are batched
+// under a single size, so at most one of them can ever verify — and the failure
+// does not say which pointer disagrees.
+func TestReadSyncLFSSharedObjectSizeConflictNamesTheFile(t *testing.T) {
+	content := []byte("one object claimed at two sizes\n")
+	oid := lfs.ComputeOID(content)
+	var batches atomic.Int32
+	f := newReadLFSFixture(t, func(w http.ResponseWriter, _ *http.Request) {
+		batches.Add(1)
+		http.Error(w, "unexpected", http.StatusInternalServerError)
+	})
+	require.True(t, ReadSync(context.Background(), f.opts).Ready)
+	commitReadPointer(t, f, "sessions/a/session.md", lfs.FormatPointer("sha256:"+oid, int64(len(content))))
+	commitReadPointer(t, f, "sessions/b/session.md", lfs.FormatPointer("sha256:"+oid, int64(len(content))+1))
+
+	result := ReadSync(context.Background(), f.opts)
+	require.False(t, result.Ready)
+	require.Equal(t, "missing_hydration", result.ErrorClass)
+	require.Equal(t, &ReadFailureDetail{Reason: "shared_object_size_conflict", Path: "sessions/b/session.md",
+		OID: oid, ExpectedSize: readSize(int64(len(content))), ActualSize: readSize(int64(len(content)) + 1)}, result.ErrorDetail)
+	require.Zero(t, batches.Load(), "a self-contradicting pointer set must not reach the server")
 }
 
 // Failure prevented: a refused object reports only "missing_hydration", so

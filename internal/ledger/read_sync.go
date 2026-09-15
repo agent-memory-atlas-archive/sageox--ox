@@ -110,7 +110,7 @@ func ReadSync(ctx context.Context, opts ReadSyncOptions) ReadSyncResult {
 		})
 	})
 	if err != nil {
-		readInterrupted(&result)
+		result.ErrorClass = "interrupted"
 	}
 	return result
 }
@@ -124,7 +124,7 @@ func readSyncLocked(ctx context.Context, opts ReadSyncOptions, transport *gitser
 	if _, err := os.Lstat(opts.Path); os.IsNotExist(err) {
 		fresh = true
 	} else if err != nil || !safeReadDirectory(opts.Path) || !Exists(opts.Path) {
-		readInterrupted(&result)
+		result.ErrorClass = "interrupted"
 		return result
 	}
 	previous := loadReadReceipt(opts.Path, opts.RepoID, opts.Endpoint)
@@ -136,17 +136,17 @@ func readSyncLocked(ctx context.Context, opts ReadSyncOptions, transport *gitser
 			return result
 		}
 		if err := publishReadReceipt(opts.Path, readReceipt{ReadSyncResult: result, ReadURL: opts.ReadURL}, previous); err != nil {
-			readInterrupted(&result)
+			result.ErrorClass = "interrupted"
 			return result
 		}
 	} else {
 		if err := os.MkdirAll(filepath.Dir(opts.Path), 0700); err != nil {
-			readInterrupted(&result)
+			result.ErrorClass = "interrupted"
 			return result
 		}
 		stage, err := os.MkdirTemp(filepath.Dir(opts.Path), ".ox-read-clone-*")
 		if err != nil {
-			readInterrupted(&result)
+			result.ErrorClass = "interrupted"
 			return result
 		}
 		workPath = stage
@@ -222,19 +222,18 @@ func readSyncLocked(ctx context.Context, opts ReadSyncOptions, transport *gitser
 		return result
 	}
 	if err := publishReadReceipt(workPath, readReceipt{ReadSyncResult: result, ReadURL: opts.ReadURL}, nil); err != nil {
-		result.Ready = false
-		readInterrupted(&result)
+		// Verification above may have recorded a detail. The failure now being
+		// reported is this write, not that object, so the detail goes with it.
+		result.Ready, result.ErrorClass, result.ErrorDetail = false, "interrupted", nil
 		return result
 	}
 	if fresh {
 		if err := os.Rename(workPath, opts.Path); err != nil {
-			result.Ready = false
-			readInterrupted(&result)
+			result.Ready, result.ErrorClass = false, "interrupted"
 			return result
 		}
 		if err := syncReadDir(filepath.Dir(opts.Path)); err != nil {
-			result.Ready = false
-			readInterrupted(&result)
+			result.Ready, result.ErrorClass = false, "interrupted"
 		}
 	}
 	return result
@@ -294,13 +293,6 @@ func safeReadOID(oid string) string {
 		}
 	}
 	return oid
-}
-
-// readInterrupted records an operation that did not complete. It drops any
-// object detail recorded earlier: the failure now being reported is about the
-// operation, not about that object.
-func readInterrupted(result *ReadSyncResult) {
-	result.ErrorClass, result.ErrorDetail = "interrupted", nil
 }
 
 func readErrorClass(ctx context.Context, err error) string {
@@ -764,7 +756,7 @@ func verifyReadCheckout(ctx context.Context, opts ReadSyncOptions, transport *gi
 	var err error
 	result.Head, err = runReadGit(ctx, transport, false, dir, "rev-parse", "--verify", "HEAD")
 	if err != nil {
-		readInterrupted(&result)
+		result.ErrorClass = "interrupted"
 		return result
 	}
 	shallow, err := runReadGit(ctx, transport, false, dir, "rev-parse", "--is-shallow-repository")
@@ -832,7 +824,7 @@ func CheckReadiness(ctx context.Context, path, repoID, endpoint string) ReadSync
 		return nil
 	})
 	if err != nil {
-		readInterrupted(&result)
+		result.ErrorClass = "interrupted"
 	}
 	return result
 }
@@ -842,7 +834,7 @@ func checkReadinessLocked(ctx context.Context, path, repoID, endpoint string) Re
 	result := newReadResult(opts)
 	previous := loadReadReceipt(path, repoID, endpoint)
 	if previous == nil {
-		readInterrupted(&result)
+		result.ErrorClass = "interrupted"
 		return result
 	}
 	opts.ReadURL = previous.ReadURL
@@ -856,8 +848,8 @@ func checkReadinessLocked(ctx context.Context, path, repoID, endpoint string) Re
 		result.LastSuccessfulSync = previous.LastSuccessfulSync
 	}
 	if err := publishReadReceipt(path, readReceipt{ReadSyncResult: result, ReadURL: opts.ReadURL}, nil); err != nil {
-		result.Ready = false
-		readInterrupted(&result)
+		// Same as the refresh path: a verification detail cannot outlive it.
+		result.Ready, result.ErrorClass, result.ErrorDetail = false, "interrupted", nil
 	}
 	return result
 }
