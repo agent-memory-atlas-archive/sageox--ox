@@ -311,6 +311,9 @@ func TestReadSyncLFSBatchRejectsInvalidResponsesBeforeMaterialization(t *testing
 		{"missing", ReadFailureDetail{Reason: "batch_response_incomplete"}},
 		{"duplicate", ReadFailureDetail{Reason: "batch_object_duplicated", OID: firstOID}},
 		{"foreign", ReadFailureDetail{Reason: "batch_object_unrequested", OID: lfs.ComputeOID([]byte("unrequested object"))}},
+		// An unrequested OID is arbitrary server text that nothing validates.
+		// It is dropped rather than republished; the reason still names the condition.
+		{"foreign credential", ReadFailureDetail{Reason: "batch_object_unrequested"}},
 		{"wrong size", ReadFailureDetail{Reason: "object_size_mismatch", Path: secondPath, OID: secondOID,
 			ExpectedSize: readSize(secondSize), ActualSize: readSize(secondSize + 1)}},
 		{"missing action", ReadFailureDetail{Reason: "object_missing_actions", Path: secondPath, OID: secondOID}},
@@ -347,6 +350,8 @@ func TestReadSyncLFSBatchRejectsInvalidResponsesBeforeMaterialization(t *testing
 					objects[1] = objects[0]
 				case "foreign":
 					objects[1].OID = lfs.ComputeOID([]byte("unrequested object"))
+				case "foreign credential":
+					objects[1].OID = "https://ox:" + readTestToken + "@ledger.invalid/repo.git?sig=" + readTestToken
 				case "wrong size":
 					objects[1].Size++
 				case "missing action":
@@ -363,6 +368,11 @@ func TestReadSyncLFSBatchRejectsInvalidResponsesBeforeMaterialization(t *testing
 			require.False(t, result.Ready)
 			require.Equal(t, "missing_hydration", result.ErrorClass)
 			require.Equal(t, &tc.detail, result.ErrorDetail)
+			rendered, err := json.Marshal(result)
+			require.NoError(t, err)
+			for _, forbidden := range []string{readTestToken, f.opts.ReadURL, "?sig=", "ledger.invalid"} {
+				require.NotContains(t, string(rendered), forbidden, "a malformed grant must not republish server bytes")
+			}
 			require.Nil(t, result.LastSuccessfulSync)
 			require.Equal(t, int32(1), batches.Load())
 			require.Zero(t, downloads.Load(), "validate the entire grant before materializing any object")

@@ -266,15 +266,34 @@ func readSize(n int64) *int64 { return &n }
 
 // recordReadFailure sets the sanitized category together with the object detail
 // err carries. Both move together so a result can never pair one failure's
-// class with another failure's object.
+// class with another failure's object. It is the only place that populates
+// ErrorDetail, which is what makes the OID sanitation below unskippable.
 func recordReadFailure(ctx context.Context, result *ReadSyncResult, err error) {
 	result.ErrorClass = readErrorClass(ctx, err)
 	result.ErrorDetail = nil
 	var failure *readFailure
 	if errors.As(err, &failure) {
 		detail := failure.detail
+		detail.OID, detail.ExpectedOID = safeReadOID(detail.OID), safeReadOID(detail.ExpectedOID)
 		result.ErrorDetail = &detail
 	}
+}
+
+// safeReadOID returns oid only when it is a canonical bare SHA-256 identifier.
+// An unrequested object in a batch response, and an "oid" line in a committed
+// pointer, are both arbitrary text that no code validates before it reaches a
+// detail. Dropping a non-canonical value keeps the result's redaction rule —
+// no credential, credential-bearing URL, or raw server bytes — unconditional.
+func safeReadOID(oid string) string {
+	if len(oid) != 64 {
+		return ""
+	}
+	for i := range len(oid) {
+		if c := oid[i]; (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return ""
+		}
+	}
+	return oid
 }
 
 // readInterrupted records an operation that did not complete. It drops any
@@ -774,13 +793,17 @@ func verifyReadCheckout(ctx context.Context, opts ReadSyncOptions, transport *gi
 		}
 	}
 	if result.Hydration.Required != result.Hydration.Completed {
-		result.Hydration.State, result.ErrorClass = "missing", "missing_hydration"
+		result.Hydration.State = "missing"
+		// Routed through recordReadFailure so this detail is sanitized on the
+		// same path as every other one.
+		missing := errors.New("missing_hydration")
 		for _, f := range files {
 			if len(f.pointer) != 0 && !f.hydrated {
-				result.ErrorDetail = &ReadFailureDetail{Reason: "object_not_materialized", Path: f.path, OID: f.ref.BareOID()}
+				missing = missingHydration(ReadFailureDetail{Reason: "object_not_materialized", Path: f.path, OID: f.ref.BareOID()})
 				break
 			}
 		}
+		recordReadFailure(ctx, &result, missing)
 		return result
 	}
 	result.Ready = true

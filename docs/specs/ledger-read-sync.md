@@ -121,6 +121,8 @@ Many distinct conditions share one `error_class` — a refused object, a malform
 | `path` | Repo-relative path of the file the object materializes. |
 | `oid` | Bare SHA-256 object identifier. |
 | `expected_oid` | Object identity the pointer should have named. |
+
+An `oid` or `expected_oid` is omitted when the value supplied for it is not a canonical bare SHA-256 identifier. A batch response may name an object that was never requested, and a committed pointer's `oid` line is unvalidated text; neither is republished.
 | `expected_size`, `actual_size` | Pointer-declared and observed sizes, in bytes. |
 | `server_code` | Status the server reported for this object. |
 
@@ -143,7 +145,7 @@ Many distinct conditions share one `error_class` — a refused object, a malform
 | `downloaded_size_mismatch` | `missing_hydration` | The downloaded bytes do not match the pointer's size. |
 | `object_not_materialized` | `missing_hydration` | Verification found a covered file still left as a stub. |
 
-Detail obeys the same redaction rules as the rest of the result: no credential, credential-bearing URL, response body, or subprocess output. There is no server message field. The client replaces a read route's per-object error prose with the status text for that error's code before any caller sees it, so a message field could only restate `server_code` and would misrepresent a client-generated string as the server's own.
+Detail obeys the same redaction rules as the rest of the result: no credential, credential-bearing URL, response body, or subprocess output. Server-supplied and pointer-supplied identifiers are validated before they are carried, never sanitized in place. There is no server message field. The client replaces a read route's per-object error prose with the status text for that error's code before any caller sees it, so a message field could only restate `server_code` and would misrepresent a client-generated string as the server's own.
 
 Consumers must tolerate additional reasons, and an absent `error_detail` on failures that name no single object.
 
