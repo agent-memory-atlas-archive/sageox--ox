@@ -73,9 +73,9 @@ func featureGatedCommandFixture() (*cobra.Command, *cobra.Command, *bool) {
 	return root, command, &ran
 }
 
-// TestRemovedAttestStaysUnavailable prevents a retained remote/environment flag
-// from restoring the retired command in the real CLI tree.
-func TestRemovedAttestStaysUnavailable(t *testing.T) {
+// TestAttestOnlyExposesPublication prevents the retired execution/status
+// surface from returning through the retained flag while preserving publication.
+func TestAttestOnlyExposesPublication(t *testing.T) {
 	previousFlags := flagsSnapshot{flags.Get()}
 	wasScoutRegistered := commandRegistered(rootCmd, scoutCmd)
 	oldOut, oldErr := rootCmd.OutOrStdout(), rootCmd.ErrOrStderr()
@@ -100,21 +100,16 @@ func TestRemovedAttestStaysUnavailable(t *testing.T) {
 			if !commandRegistered(rootCmd, scoutCmd) {
 				t.Fatal("removing Attest broke Scout opt-in registration")
 			}
-			var output bytes.Buffer
-			rootCmd.SetOut(&output)
-			rootCmd.SetErr(&output)
-			if err := rootCmd.Help(); err != nil {
-				t.Fatalf("render root help: %v", err)
+			if !commandRegistered(rootCmd, attestCmd) {
+				t.Fatal("publication command is not registered")
 			}
-			if strings.Contains(output.String(), "attest") {
-				t.Fatalf("removed command leaked into help:\n%s", output.String())
-			}
-			if _, _, err := rootCmd.Find([]string{"attest"}); err == nil {
-				t.Fatal("removed command is still discoverable")
+			found, args, err := rootCmd.Find([]string{"attest", "publish"})
+			if err != nil || found != attestPublishCmd || len(args) != 0 {
+				t.Fatalf("publication lookup command=%v args=%v err=%v", found, args, err)
 			}
 			rootCmd.SetArgs([]string{"attest", "status"})
-			if err := rootCmd.Execute(); err == nil || !strings.Contains(err.Error(), `unknown command "attest"`) {
-				t.Fatalf("removed command execution error = %v, want unknown command attest", err)
+			if err := rootCmd.Execute(); err == nil || !strings.Contains(err.Error(), `unknown command "status"`) {
+				t.Fatalf("retired command execution error = %v, want unknown command status", err)
 			}
 		})
 	}

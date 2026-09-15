@@ -1,0 +1,10 @@
+{
+  "schema_version": "1.0",
+  "source_run_id": "step-tree-is-not-semantic",
+  "producer": {"name": "fixture", "version": "1"},
+  "source": {"git": {"branch": null, "commit_sha": null, "dirty": null}},
+  "timing": {"started_at": "2026-09-10T20:00:00Z", "finished_at": "2026-09-10T20:00:00Z", "duration_ms": 0},
+  "corpus": {"key": "payments", "capabilities": [{"key": "x", "title": "x", "tags": [], "source": "declared", "features": [{"path": "x.feature", "title": "x", "tags": [], "scenarios": [{"key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "title": "x", "tags": [], "kind": "scenario", "examples": [], "steps": []}], "rules": []}]}]},
+  "outcomes": [],
+  "extensions": {}
+}
