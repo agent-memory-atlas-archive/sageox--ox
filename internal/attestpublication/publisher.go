@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/aws/smithy-go"
@@ -23,19 +24,34 @@ type PublishResult struct {
 
 // Publish serializes the entire journal lifecycle across CLI processes.
 func (publisher Publisher) Publish(ctx context.Context, repoID, journalPath string, archive Package) (PublishResult, error) {
-	return withPublicationLock(ctx, journalPath, func() (PublishResult, error) {
-		return publisher.publish(ctx, repoID, journalPath, archive)
+	return withPublicationLock(ctx, journalPath, func(state *publicationState) (PublishResult, error) {
+		root := state.root
+		if filepath.Clean(filepath.Dir(archive.ArchivePath)) != filepath.Clean(filepath.Dir(journalPath)) {
+			var err error
+			root, err = openPublicationRoot(filepath.Dir(archive.ArchivePath))
+			if err != nil {
+				return PublishResult{}, err
+			}
+			defer root.Close()
+		}
+		var err error
+		state.archive, err = root.Open(filepath.Base(archive.ArchivePath))
+		if err != nil {
+			return PublishResult{}, err
+		}
+		defer state.archive.Close()
+		return publisher.publish(ctx, repoID, journalPath, archive, state)
 	})
 }
 
-func (publisher Publisher) publish(ctx context.Context, repoID, journalPath string, archive Package) (PublishResult, error) {
+func (publisher Publisher) publish(ctx context.Context, repoID, journalPath string, archive Package, state *publicationState) (PublishResult, error) {
 	if publisher.Control == nil {
 		return PublishResult{}, errors.New("attest control client is required")
 	}
 	if publisher.Transfer == nil {
 		publisher.Transfer = S3Multipart{}
 	}
-	journal, err := LoadJournal(journalPath)
+	journal, err := loadJournal(journalPath, state)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return PublishResult{}, fmt.Errorf("read attest upload journal: %w", err)
 	}
@@ -98,6 +114,7 @@ func (publisher Publisher) publish(ctx context.Context, repoID, journalPath stri
 		}
 	} else {
 		journal, err = NewPendingJournal(archive)
+		journal.state = state
 		if err != nil {
 			return PublishResult{}, err
 		}

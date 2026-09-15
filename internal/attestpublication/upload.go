@@ -46,6 +46,8 @@ type Multipart interface {
 // bookkeeping. STS credentials are short-lived secrets and must never survive
 // the process that received them.
 type Journal struct {
+	state *publicationState
+
 	Version         int             `json:"version"`
 	RunID           string          `json:"run_id"`
 	SourceRunID     string          `json:"source_run_id"`
@@ -58,12 +60,20 @@ type Journal struct {
 	IdempotencyKey  string          `json:"idempotency_key"`
 }
 
-func LoadJournal(path string) (Journal, error) {
-	raw, err := os.ReadFile(path)
+func LoadJournal(path string) (Journal, error) { return loadJournal(path, nil) }
+
+func loadJournal(path string, state *publicationState) (Journal, error) {
+	var raw []byte
+	var err error
+	if state == nil {
+		raw, err = os.ReadFile(path)
+	} else {
+		raw, err = state.root.ReadFile(filepath.Base(path))
+	}
 	if err != nil {
 		return Journal{}, err
 	}
-	var journal Journal
+	journal := Journal{state: state}
 	if err := json.Unmarshal(raw, &journal); err != nil {
 		return Journal{}, err
 	}
@@ -73,6 +83,9 @@ func LoadJournal(path string) (Journal, error) {
 	return journal, nil
 }
 func SaveJournal(path string, journal Journal) error {
+	if journal.state != nil {
+		return journal.state.save(path, journal)
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
@@ -151,11 +164,16 @@ func UploadArchive(ctx context.Context, transfer Multipart, grant Grant, journal
 	if err := SaveJournal(journalPath, *journal); err != nil {
 		return err
 	}
-	file, err := os.Open(journal.ArchivePath)
-	if err != nil {
-		return err
+	var file *os.File
+	if journal.state != nil {
+		file = journal.state.archive
+	} else {
+		file, err = os.Open(journal.ArchivePath)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
 	}
-	defer file.Close()
 	info, err := file.Stat()
 	if err != nil {
 		return err

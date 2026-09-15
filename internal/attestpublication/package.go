@@ -65,6 +65,15 @@ type RunIdentity struct {
 // calling checkout, because publication after a feature edit must retain the
 // corpus admitted when the run started.
 func BuildPackage(exportDir, archivePath string) (Package, error) {
+	output, err := openPublicationRoot(filepath.Dir(archivePath))
+	if err != nil {
+		return Package{}, err
+	}
+	defer output.Close()
+	return buildPackage(exportDir, archivePath, output)
+}
+
+func buildPackage(exportDir, archivePath string, output *os.Root) (Package, error) {
 	if archivePath == "" {
 		return Package{}, fmt.Errorf("archive path is required")
 	}
@@ -93,10 +102,15 @@ func BuildPackage(exportDir, archivePath string) (Package, error) {
 	if err := validateManifestSemantics(manifest); err != nil {
 		return Package{}, fmt.Errorf("validate package manifest semantics: %w", err)
 	}
-	if err := writeArchive(archivePath, root, files, manifest); err != nil {
+	if err := writeArchive(archivePath, output, root, files, manifest); err != nil {
 		return Package{}, err
 	}
-	archiveDigest, archiveSize, err := hashFile(archivePath)
+	file, err := output.Open(filepath.Base(archivePath))
+	if err != nil {
+		return Package{}, err
+	}
+	defer file.Close()
+	archiveDigest, archiveSize, err := hashArchiveFile(file)
 	if err != nil {
 		return Package{}, err
 	}
@@ -175,17 +189,12 @@ func marshalManifest(files []ManifestFile) ([]byte, error) {
 	return bytes.TrimSuffix(out.Bytes(), []byte("\n")), nil
 }
 
-func writeArchive(target string, root *os.Root, files []ManifestFile, manifest []byte) error {
-	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-		return err
-	}
-	// Exclusive random names cannot follow a pre-created temporary symlink.
-	f, err := os.CreateTemp(filepath.Dir(target), ".attest-archive-*")
+func writeArchive(target string, output, root *os.Root, files []ManifestFile, manifest []byte) error {
+	f, temporary, err := createPublicationTemp(output, ".attest-archive-")
 	if err != nil {
 		return err
 	}
-	temporary := f.Name()
-	defer os.Remove(temporary)
+	defer func() { _ = output.Remove(temporary) }()
 	archive := zip.NewWriter(f)
 	for _, file := range files {
 		if err := addArchiveFile(archive, root, file.Path); err != nil {
@@ -210,7 +219,11 @@ func writeArchive(target string, root *os.Root, files []ManifestFile, manifest [
 	if err := f.Close(); err != nil {
 		return err
 	}
-	return os.Rename(temporary, target)
+	if err := output.Rename(temporary, filepath.Base(target)); err != nil {
+		return err
+	}
+	syncArchiveParent(output)
+	return nil
 }
 
 func addArchiveFile(archive *zip.Writer, root *os.Root, name string) error {
@@ -421,13 +434,12 @@ func contentType(path string) string {
 }
 
 func digest(raw []byte) string { sum := sha256.Sum256(raw); return hex.EncodeToString(sum[:]) }
-func hashFile(path string) (string, int64, error) {
-	f, err := os.Open(path)
+func hashArchiveFile(f *os.File) (string, int64, error) {
+	info, err := f.Stat()
 	if err != nil {
 		return "", 0, err
 	}
-	defer f.Close()
 	h := sha256.New()
-	size, err := io.Copy(h, f)
+	size, err := io.Copy(h, io.NewSectionReader(f, 0, info.Size()))
 	return hex.EncodeToString(h.Sum(nil)), size, err
 }
