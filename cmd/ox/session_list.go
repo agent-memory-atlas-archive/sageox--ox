@@ -64,7 +64,7 @@ session data reflects the --repo target, but ledger-merged sessions still
 come from the CURRENT directory's configured ledger — this only matters
 if the two repos use different team ledgers.
 
-Pass a canonical repo_<uuid> to --repo instead to read a hosted ledger kept
+Pass a canonical ` + "`repo_<uuid>`" + ` to --repo instead to read a hosted ledger kept
 by 'ox sync --read-only'. That form needs no checkout and no project: it
 selects the ledger with SAGEOX_ENDPOINT and XDG_DATA_HOME, and reads it
 while holding the same lock the refresh takes, so a concurrent refresh

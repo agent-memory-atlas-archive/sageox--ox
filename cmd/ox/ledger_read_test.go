@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/cgi"
 	"net/http/httptest"
@@ -290,33 +292,50 @@ func TestHostedReaderSerializesAgainstConcurrentRefresh(t *testing.T) {
 
 	// Hold the lock the way a refresh does, then empty the worktree underneath
 	// it. A reader that ignores the guard observes zero sessions.
-	held, release := make(chan struct{}), make(chan struct{})
+	// require.* in a non-test goroutine calls runtime.Goexit, which would skip
+	// close(held) and hang the test instead of failing it. Every check in the
+	// refresh worker is therefore assert.* plus an explicit return, and
+	// refreshDone lets the main goroutine notice a worker that died early.
+	held, release, refreshDone := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	var refresh sync.WaitGroup
 	refresh.Add(1)
 	go func() {
 		defer refresh.Done()
-		require.NoError(t, gitutil.WithRepoLock(t.Context(), f.path, func() error {
+		defer close(refreshDone)
+		_ = gitutil.WithRepoLock(t.Context(), f.path, func() error {
 			dir := filepath.Join(f.path, "sessions", f.sessionName)
 			saved := map[string][]byte{}
 			entries, err := os.ReadDir(dir)
-			require.NoError(t, err)
+			if !assert.NoError(t, err) {
+				return err
+			}
 			for _, e := range entries {
 				body, err := os.ReadFile(filepath.Join(dir, e.Name()))
-				require.NoError(t, err)
+				if !assert.NoError(t, err) {
+					return err
+				}
 				saved[e.Name()] = body
 			}
-			require.NoError(t, os.RemoveAll(dir))
+			if !assert.NoError(t, os.RemoveAll(dir)) {
+				return errors.New("remove failed")
+			}
 			close(held)
 			<-release
 			// Put the ledger back before the reader is allowed to look at it.
-			require.NoError(t, os.MkdirAll(dir, 0700))
+			if !assert.NoError(t, os.MkdirAll(dir, 0700)) {
+				return errors.New("restore failed")
+			}
 			for name, body := range saved {
-				require.NoError(t, os.WriteFile(filepath.Join(dir, name), body, 0600))
+				assert.NoError(t, os.WriteFile(filepath.Join(dir, name), body, 0600))
 			}
 			return nil
-		}))
+		})
 	}()
-	<-held
+	select {
+	case <-held:
+	case <-refreshDone:
+		t.Fatal("refresh worker failed before it reached the midpoint")
+	}
 
 	listed := make(chan sessionListOutput, 1)
 	var reader sync.WaitGroup
@@ -344,7 +363,15 @@ func TestHostedReaderSerializesAgainstConcurrentRefresh(t *testing.T) {
 	refresh.Wait()
 	reader.Wait()
 
-	out := <-listed
+	// Non-blocking: the reader goroutine reports its own failures through
+	// assert.*, and a reader that failed never sent. Receiving blindly here
+	// would turn that into a hang.
+	var out sessionListOutput
+	select {
+	case out = <-listed:
+	default:
+		t.Fatal("reader produced no output")
+	}
 	require.Len(t, out.Sessions, 1, "reader must see the restored ledger, never the refresh midpoint")
 	require.Equal(t, f.sessionName, out.Sessions[0].Name)
 }
@@ -434,6 +461,12 @@ func TestHostedLedgerSelection(t *testing.T) {
 		{[]string{"glance", "--since", "3d"}, false},
 		{[]string{"session", "list", "--", "--repo", readSyncTestRepoID}, false},
 		{[]string{"query", "--repo", readSyncTestRepoID}, false},
+		// Cobra binds the LAST --repo. If preflight read the first, a repeated
+		// flag would run the project prelude — loading dotenv from the working
+		// directory — and only then select the hosted checkout.
+		{[]string{"session", "list", "--repo", "/local/path", "--repo", readSyncTestRepoID}, true},
+		{[]string{"glance", "--repo", "/local/path", "--repo=" + readSyncTestRepoID}, true},
+		{[]string{"glance", "--repo", readSyncTestRepoID, "--repo", "/local/path"}, false},
 	} {
 		require.Equal(t, tc.want, headlessLedgerReadRequested(tc.args), "%v", tc.args)
 	}
@@ -646,4 +679,70 @@ func TestReaderParseFailureDoesNotEmitASyncReceipt(t *testing.T) {
 	require.Equal(t, 2, writeReadSyncUsageError(cmd, args))
 	require.Empty(t, out.String(), "stdout must stay empty; a receipt here decodes as a session list that failed open")
 	require.Equal(t, "Ledger read failed: invalid_arguments\n", errOut.String())
+}
+
+// Failure prevented: a signal arriving after the checkout lock is taken does not
+// stop the reader — the ledger readers walk the filesystem through context-free
+// APIs — so the traversal runs to completion and the command reports success for
+// a read the caller already abandoned.
+func TestHostedReadCanceledMidReadIsNotReportedAsSuccess(t *testing.T) {
+	f := newHostedReaderFixture(t)
+	require.NotEmpty(t, f.path)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	var stderr bytes.Buffer
+	cmd := &cobra.Command{}
+	cmd.SetContext(ctx)
+	cmd.SetOut(&bytes.Buffer{})
+	cmd.SetErr(&stderr)
+
+	// The read succeeds; cancellation lands while it is in flight, exactly as a
+	// hosted runtime's tool deadline would deliver SIGTERM.
+	err := withHostedLedger(cmd, readSyncTestRepoID, func(string) error {
+		cancel()
+		return nil
+	})
+	require.Equal(t, 1, exitCodeOf(t, err))
+	require.Equal(t, "Ledger read failed: interrupted\n", stderr.String())
+}
+
+// Failure prevented: the activity checkpoint advances before the activity is
+// delivered, so a failed write silently skips that window forever — the next
+// bare `ox glance` resumes past murmurs the consumer never received.
+func TestProjectGlanceKeepsTheCheckpointWhenOutputFails(t *testing.T) {
+	projectRoot, ledgerPath := setupLedgerProject(t)
+	t.Chdir(projectRoot)
+
+	now := time.Now().UTC()
+	body, err := json.Marshal(ledger.MurmurFile{
+		SchemaVersion: "1", ID: "mur_x", Timestamp: now,
+		AgentID: "Ox0003", PrincipalID: "riley", Topic: "wip",
+		Importance: "normal", Content: "must survive a failed write",
+	})
+	require.NoError(t, err)
+	dir := filepath.Join(ledgerPath, ledger.MurmurDateHourDir(now))
+	require.NoError(t, os.MkdirAll(dir, 0700))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "mur_x.json"), body, 0600))
+
+	cmd := &cobra.Command{Use: "glance", RunE: glanceCmd.RunE, SilenceErrors: true, SilenceUsage: true}
+	cmd.Flags().AddFlagSet(glanceCmd.Flags())
+	cmd.PersistentFlags().AddFlagSet(rootCmd.PersistentFlags())
+	// A closed pipe is what a consumer that hung up actually leaves behind.
+	r, w := io.Pipe()
+	require.NoError(t, r.Close())
+	defer w.Close()
+	cmd.SetOut(w)
+	cmd.SetErr(&bytes.Buffer{})
+	cmd.SetArgs([]string{"--since", now.Add(-time.Hour).Format(time.RFC3339)})
+	require.Error(t, cmd.Execute(), "a failed write must surface")
+
+	// With no checkpoint recorded, GetSince falls back to DefaultWindow ago.
+	// MarkRead would have stored ~now instead, so the distance from now is what
+	// separates "never advanced" from "advanced past undelivered activity" —
+	// comparing against a pre-run GetSince cannot, since the fallback itself
+	// moves with the clock.
+	resume := glance.GetSince(ledgerPath)
+	require.Greater(t, time.Since(resume), time.Hour,
+		"checkpoint advanced to %v despite the write failing; the next glance would skip that window", resume)
 }

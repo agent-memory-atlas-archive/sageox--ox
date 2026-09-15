@@ -28,10 +28,16 @@ func hostedLedgerSelected(repo string) bool {
 // hostedLedgerRepoArg returns the --repo value in args, handling both the
 // "--repo=value" and "--repo value" spellings. It runs before Cobra parses, so
 // it cannot ask the flag set. Everything after "--" is a positional argument.
+//
+// The LAST occurrence wins, because that is the one Cobra binds. Returning the
+// first would let `--repo /some/path --repo repo_<uuid>` run the project
+// prelude — loading dotenv from the working directory — and only then select
+// the hosted checkout, which is exactly the influence this path exists to deny.
 func hostedLedgerRepoArg(args []string) string {
+	repo := ""
 	for i, arg := range args {
 		if arg == "--" {
-			return ""
+			break
 		}
 		name, value, split := strings.Cut(arg, "=")
 		if name != "--repo" {
@@ -40,9 +46,9 @@ func hostedLedgerRepoArg(args []string) string {
 		if !split && i+1 < len(args) {
 			value = args[i+1]
 		}
-		return value
+		repo = value
 	}
-	return ""
+	return repo
 }
 
 // selectHostedLedger resolves the checkout for repoID from the trusted headless
@@ -111,6 +117,14 @@ func withHostedLedger(cmd *cobra.Command, repoID string, read func(path string) 
 		// Everything else is a failure to take the lock: a wedged peer, an
 		// expired budget, or a signal. CheckReadiness classifies these the
 		// same way.
+		return hostedReadFailed(cmd, "interrupted", 1)
+	}
+	// The ledger readers walk the filesystem through context-free APIs, so a
+	// signal delivered after the lock was taken does not stop the traversal —
+	// it runs to completion and reports success. Re-check before the caller
+	// renders anything: a result gathered across a cancellation is not one the
+	// consumer asked for, and the process is on its way down regardless.
+	if ctx.Err() != nil {
 		return hostedReadFailed(cmd, "interrupted", 1)
 	}
 	return readErr

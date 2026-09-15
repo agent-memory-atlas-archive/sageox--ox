@@ -88,10 +88,15 @@ func runGlance(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
-	// Advance checkpoint so next invocation without --since starts from now
+	if err := outputGlanceJSON(cmd.OutOrStdout(), data); err != nil {
+		return err
+	}
+	// Advance the checkpoint only once the activity has actually been written.
+	// Advancing first means a failed write — a closed pipe, a full disk — skips
+	// that window forever: the next bare invocation resumes after activity the
+	// consumer never received.
 	_ = glance.MarkRead(ledgerPath)
-
-	return outputGlanceJSON(cmd.OutOrStdout(), data)
+	return nil
 }
 
 // runHostedGlance reports a hosted ledger's activity under the shared checkout
