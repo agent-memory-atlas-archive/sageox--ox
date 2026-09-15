@@ -57,15 +57,16 @@ type ReadSyncResult struct {
 	Coverage           ReadCoverage  `json:"coverage"`
 	Hydration          ReadHydration `json:"hydration"`
 	ErrorClass         string        `json:"error_class,omitempty"`
-	// ErrorDetail names the object a failure is about. Additive within
-	// schema_version 1; consumers keep matching on ErrorClass.
+	// ErrorDetail says what failed, naming the object when one is identifiable.
+	// Additive within schema_version 1; consumers keep matching on ErrorClass.
 	ErrorDetail *ReadFailureDetail `json:"error_detail,omitempty"`
 }
 
-// ReadFailureDetail names the object a failure is about, so an operator can act
-// on it instead of correlating server request logs against object storage by
-// hand. Reason tells apart conditions that deliberately share one error_class;
-// the remaining fields are set only where they apply.
+// ReadFailureDetail says what failed, naming the object when one is
+// identifiable, so an operator can act on it instead of correlating server
+// request logs against object storage by hand. Reason tells apart conditions
+// that deliberately share one error_class and is always set; every other field
+// applies only to some reasons. A batch-level failure carries Reason alone.
 //
 // Every field is locally computed or a server-supplied status code. No
 // credential, signed URL, response body, or subprocess output is carried here.
@@ -270,6 +271,13 @@ func readSize(n int64) *int64 { return &n }
 func recordReadFailure(ctx context.Context, result *ReadSyncResult, err error) {
 	result.ErrorClass = readErrorClass(ctx, err)
 	result.ErrorDetail = nil
+	// A canceled or expired context classifies as "interrupted" whatever err
+	// says, including an object failure raised just before the deadline landed
+	// — verification runs Git subprocesses between the two. The operation, not
+	// that object, is what failed, so the detail goes with it.
+	if result.ErrorClass == "interrupted" {
+		return
+	}
 	var failure *readFailure
 	if errors.As(err, &failure) {
 		detail := failure.detail

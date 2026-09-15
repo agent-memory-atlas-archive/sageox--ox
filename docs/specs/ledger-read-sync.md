@@ -87,7 +87,7 @@ The sample paths and counts are illustrative; the returned coverage describes th
 | `hydration.state` | `complete`, `missing`, or `unknown`. |
 | `hydration.required`, `hydration.completed` | Required current-worktree LFS objects and successfully verified objects. |
 | `error_class` | Sanitized failure category, omitted when none. |
-| `error_detail` | The object a failure is about, omitted when no single object is identifiable. See [Failure detail](#failure-detail). |
+| `error_detail` | What failed, omitted when the failure carries no recognized reason. See [Failure detail](#failure-detail). |
 
 | Exit | Contract |
 | --- | --- |
@@ -117,7 +117,7 @@ Many distinct conditions share one `error_class` — a refused object, a malform
 
 | Field | Meaning |
 | --- | --- |
-| `reason` | Which condition failed. Always present. |
+| `reason` | Which condition failed. Always present; every other field applies only to some reasons. |
 | `path` | Repo-relative path of the file the object materializes. |
 | `oid` | Bare SHA-256 object identifier. |
 | `expected_oid` | Object identity the pointer should have named. |
@@ -147,7 +147,7 @@ An `oid` or `expected_oid` is omitted when the value supplied for it is not a ca
 
 Detail obeys the same redaction rules as the rest of the result: no credential, credential-bearing URL, response body, or subprocess output. Server-supplied and pointer-supplied identifiers are validated before they are carried, never sanitized in place. There is no server message field. The client replaces a read route's per-object error prose with the status text for that error's code before any caller sees it, so a message field could only restate `server_code` and would misrepresent a client-generated string as the server's own.
 
-Consumers must tolerate additional reasons, and an absent `error_detail` on failures that name no single object.
+Consumers must tolerate three things: additional reasons; a detail carrying `reason` alone, because a batch-level failure such as `batch_response_incomplete` identifies no single object; and an absent `error_detail`, because a failure raised without a reason — a denied batch request, a Git failure, a canceled operation — carries none.
 
 ## Remote evidence and local recovery
 

@@ -389,6 +389,26 @@ func TestReadSyncLFSBatchRejectsInvalidResponsesBeforeMaterialization(t *testing
 	}
 }
 
+// Failure prevented: a deadline that lands after an object failure was raised
+// reports "interrupted" while still naming the object, so error_class and
+// error_detail describe two different failures. Verification runs Git
+// subprocesses between the two, so the window is an ordinary timeout, not a race.
+func TestRecordReadFailureDropsDetailWhenTheOperationWasInterrupted(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	failure := missingHydration(ReadFailureDetail{Reason: "object_refused", Path: "sessions/a/session.md"})
+
+	var live ReadSyncResult
+	recordReadFailure(ctx, &live, failure)
+	require.Equal(t, "missing_hydration", live.ErrorClass)
+	require.NotNil(t, live.ErrorDetail)
+
+	cancel()
+	var interrupted ReadSyncResult
+	recordReadFailure(ctx, &interrupted, failure)
+	require.Equal(t, "interrupted", interrupted.ErrorClass)
+	require.Nil(t, interrupted.ErrorDetail, "the class and the detail must describe one failure")
+}
+
 // Failure prevented: a server-controlled or pointer-supplied identifier is
 // republished verbatim in error_detail, turning a diagnostic field into a
 // channel for credentials and arbitrary bytes.
