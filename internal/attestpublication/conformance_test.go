@@ -48,6 +48,11 @@ func TestVendoredContractConformance(t *testing.T) {
 				}
 			case "observations":
 				schemaErr = validateVendoredSchema(t, "observations.schema.json", "", raw)
+				if schemaErr == nil {
+					semanticErr = validateObservationsSemantics(raw)
+				}
+			case "workflow":
+				schemaErr = validateVendoredSchema(t, "workflow.schema.json", "", raw)
 			case "lifecycle":
 				schemaErr = validateVendoredSchema(t, "lifecycle.schema.json", "", raw)
 			default:

@@ -72,10 +72,6 @@ func runAttestPublish(cmd *cobra.Command, _ []string) error {
 	if repoID == "" {
 		return errors.New("this repository has no SageOx repo_id; run ox init first")
 	}
-	pkg, err := attestpublication.BuildPackage(absFrom, filepath.Join(absOut, "attest-run.zip"))
-	if err != nil {
-		return fmt.Errorf("package frozen Attest run: %w", err)
-	}
 	ep := endpoint.GetForProject(projectRoot)
 	token, err := auth.EnsureValidTokenForEndpoint(ep, 300)
 	if err != nil {
@@ -85,7 +81,7 @@ func runAttestPublish(cmd *cobra.Command, _ []string) error {
 		return errors.New("sign in with ox login before publishing an Attest run")
 	}
 	publisher := attestpublication.Publisher{Control: &attestpublication.ControlClient{BaseURL: ep, Token: token.AccessToken}}
-	result, err := publisher.Publish(cmd.Context(), repoID, filepath.Join(absOut, "attest-upload.json"), pkg)
+	result, err := publisher.PublishExport(cmd.Context(), repoID, absFrom, absOut)
 	if err != nil {
 		return renderAttestPublishError(err)
 	}

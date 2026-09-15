@@ -20,6 +20,7 @@
       }
     },
     "counts": {
+      "$comment": "Semantic validation must recompute each status count from evidence and require referenced to equal evidence.length; JSON Schema cannot compare these aggregate values.",
       "type": "object", "additionalProperties": false, "required": ["referenced", "available", "missing", "invalid"],
       "properties": {
         "referenced": {"type": "integer", "minimum": 0}, "available": {"type": "integer", "minimum": 0},

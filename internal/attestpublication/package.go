@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"mime"
 	"os"
 	"path/filepath"
 	"slices"
@@ -180,11 +179,13 @@ func writeArchive(target string, root *os.Root, files []ManifestFile, manifest [
 	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 		return err
 	}
-	temporary := target + ".tmp"
-	f, err := os.OpenFile(temporary, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	// Exclusive random names cannot follow a pre-created temporary symlink.
+	f, err := os.CreateTemp(filepath.Dir(target), ".attest-archive-*")
 	if err != nil {
 		return err
 	}
+	temporary := f.Name()
+	defer os.Remove(temporary)
 	archive := zip.NewWriter(f)
 	for _, file := range files {
 		if err := addArchiveFile(archive, root, file.Path); err != nil {
@@ -199,6 +200,10 @@ func writeArchive(target string, root *os.Root, files []ManifestFile, manifest [
 		return err
 	}
 	if err := archive.Close(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
 		_ = f.Close()
 		return err
 	}
@@ -396,9 +401,21 @@ func validRelativePath(path string) error {
 	return nil
 }
 
+// Pin package metadata independently of host MIME databases so retries on a
+// different operating system produce the same manifest and archive identity.
+var packageContentTypes = map[string]string{
+	".css": "text/css", ".csv": "text/csv", ".html": "text/html", ".htm": "text/html",
+	".js": "text/javascript", ".mjs": "text/javascript", ".json": "application/json",
+	".md": "text/markdown", ".txt": "text/plain", ".xml": "application/xml",
+	".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+	".svg": "image/svg+xml", ".webp": "image/webp", ".ico": "image/vnd.microsoft.icon",
+	".mp4": "video/mp4", ".webm": "video/webm", ".mp3": "audio/mpeg", ".wav": "audio/wav",
+	".pdf": "application/pdf", ".zip": "application/zip", ".woff": "font/woff", ".woff2": "font/woff2",
+}
+
 func contentType(path string) string {
-	if value := mime.TypeByExtension(filepath.Ext(path)); value != "" {
-		return strings.Split(value, ";")[0]
+	if value, ok := packageContentTypes[strings.ToLower(filepath.Ext(path))]; ok {
+		return value
 	}
 	return "application/octet-stream"
 }

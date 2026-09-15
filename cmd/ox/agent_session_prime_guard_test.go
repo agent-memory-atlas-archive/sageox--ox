@@ -23,6 +23,10 @@ import (
 // CLAUDE_CODE_SESSION_ID) triggers an unbounded recursive self-invocation of
 // the whole test binary instead of returning.
 func TestEnsurePrimeBeforeSession_DoesNotRecurseUnderGoTest(t *testing.T) {
+	// A developer's active Codex runtime must not compete with this Claude fixture.
+	isolateAgentDetection(t)
+	t.Setenv("CODEX_CI", "")
+	t.Setenv("CODEX_SANDBOX", "")
 	// A session ID agentx's ClaudeCodeAgent will report via SessionID(), with
 	// no corresponding marker on disk — this is exactly the "prime hasn't run
 	// yet" state that used to trigger the exec.Command call.

@@ -76,7 +76,8 @@
       "properties": {
         "cursor": {"type": "string", "minLength": 1}, "next_cursor": {"type": "string", "minLength": 1},
         "limit": {"type": "integer", "minimum": 1, "maximum": 100}, "has_more": {"type": "boolean"}
-      }
+      },
+      "allOf": [{"if": {"properties": {"has_more": {"const": true}}, "required": ["has_more"]}, "then": {"required": ["next_cursor"]}}]
     },
     "runListResponse": {
       "type": "object", "additionalProperties": false, "required": ["items", "pagination"],

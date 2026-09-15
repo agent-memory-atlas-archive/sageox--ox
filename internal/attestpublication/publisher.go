@@ -21,7 +21,14 @@ type PublishResult struct {
 	JournalPath string
 }
 
+// Publish serializes the entire journal lifecycle across CLI processes.
 func (publisher Publisher) Publish(ctx context.Context, repoID, journalPath string, archive Package) (PublishResult, error) {
+	return withPublicationLock(ctx, journalPath, func() (PublishResult, error) {
+		return publisher.publish(ctx, repoID, journalPath, archive)
+	})
+}
+
+func (publisher Publisher) publish(ctx context.Context, repoID, journalPath string, archive Package) (PublishResult, error) {
 	if publisher.Control == nil {
 		return PublishResult{}, errors.New("attest control client is required")
 	}
@@ -51,7 +58,8 @@ func (publisher Publisher) Publish(ctx context.Context, repoID, journalPath stri
 				if err := SaveJournal(journalPath, journal); err != nil {
 					return PublishResult{}, err
 				}
-				return PublishResult{Run: run, Package: archive, JournalPath: journalPath}, nil
+				run, err = publisher.poll(ctx, repoID, run)
+				return PublishResult{Run: run, Package: archive, JournalPath: journalPath}, err
 			}
 			journal, err = journal.Bind(run)
 			if err != nil {
@@ -105,7 +113,8 @@ func (publisher Publisher) Publish(ctx context.Context, repoID, journalPath stri
 			if err := SaveJournal(journalPath, journal); err != nil {
 				return PublishResult{}, err
 			}
-			return PublishResult{Run: run, Package: archive, JournalPath: journalPath}, nil
+			run, err = publisher.poll(ctx, repoID, run)
+			return PublishResult{Run: run, Package: archive, JournalPath: journalPath}, err
 		}
 		journal, err = journal.Bind(run)
 		if err != nil {

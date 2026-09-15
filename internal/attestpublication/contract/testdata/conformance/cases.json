@@ -198,6 +198,114 @@
       "kind": "lifecycle",
       "path": "invalid/lifecycle-non-v7-id.json",
       "valid": false
+    },
+    {
+      "name": "next page without continuation cursor rejected",
+      "kind": "control:runListResponse",
+      "path": "invalid/pagination-missing-next-cursor.json",
+      "valid": false
+    },
+    {
+      "name": "last page needs no continuation cursor",
+      "kind": "control:runListResponse",
+      "path": "valid/pagination-last-page.json",
+      "valid": true
+    },
+    {
+      "name": "mixed observations counts match evidence",
+      "kind": "observations",
+      "path": "valid/observations-mixed-status.json",
+      "valid": true
+    },
+    {
+      "name": "observations referenced count mismatch rejected",
+      "kind": "observations",
+      "path": "invalid/observations-count-referenced.json",
+      "valid": false
+    },
+    {
+      "name": "observations available count mismatch rejected",
+      "kind": "observations",
+      "path": "invalid/observations-count-available.json",
+      "valid": false
+    },
+    {
+      "name": "observations missing count mismatch rejected",
+      "kind": "observations",
+      "path": "invalid/observations-count-missing.json",
+      "valid": false
+    },
+    {
+      "name": "observations invalid count mismatch rejected",
+      "kind": "observations",
+      "path": "invalid/observations-count-invalid.json",
+      "valid": false
+    },
+    {
+      "name": "run feature parent segment rejected",
+      "kind": "run",
+      "path": "invalid/run-feature-parent-segment.json",
+      "valid": false
+    },
+    {
+      "name": "run feature dot segment rejected",
+      "kind": "run",
+      "path": "invalid/run-feature-dot-segment.json",
+      "valid": false
+    },
+    {
+      "name": "run evidence parent segment rejected",
+      "kind": "run",
+      "path": "invalid/run-evidence-parent-segment.json",
+      "valid": false
+    },
+    {
+      "name": "run evidence dot segment rejected",
+      "kind": "run",
+      "path": "invalid/run-evidence-dot-segment.json",
+      "valid": false
+    },
+    {
+      "name": "workflow publish payload accepted",
+      "kind": "workflow",
+      "path": "valid/workflow-publish.json",
+      "valid": true
+    },
+    {
+      "name": "workflow delete payload accepted",
+      "kind": "workflow",
+      "path": "valid/workflow-delete.json",
+      "valid": true
+    },
+    {
+      "name": "workflow malformed-run-id rejected",
+      "kind": "workflow",
+      "path": "invalid/workflow-malformed-run-id.json",
+      "valid": false
+    },
+    {
+      "name": "workflow non-v7-repo-id rejected",
+      "kind": "workflow",
+      "path": "invalid/workflow-non-v7-repo-id.json",
+      "valid": false
+    },
+    {
+      "name": "workflow incomplete publish branch rejected",
+      "kind": "workflow",
+      "path": "invalid/workflow-publish-missing-archive.json",
+      "valid": false
+    },
+    {
+      "name": "workflow delete with publish-only field rejected",
+      "kind": "workflow",
+      "path": "invalid/workflow-delete-extra-upload.json",
+      "valid": false
+    },
+    {
+      "name": "observations negative size rejected",
+      "kind": "observations",
+      "path": "invalid/observations-negative-size.json",
+      "valid": false
     }
   ],
   "package_case": {

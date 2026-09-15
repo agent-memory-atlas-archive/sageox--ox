@@ -150,7 +150,7 @@ func TestPublisherUsesInitialGrantWithoutRenewal(t *testing.T) {
 			if request.ArchiveSHA256 != pkg.ArchiveSHA256 {
 				t.Error("wrong archive binding")
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"run_id": "bdd_00000000-0000-7000-8000-000000000001", "status": "uploading", "source_run_id": pkg.Run.SourceRunID, "corpus_key": pkg.Run.Corpus.Key, "created_at": "2026-01-01T00:00:00Z", "diagnostics": []any{}, "upload": map[string]any{"bucket": "bucket", "key": "staging/key", "region": "us-west-2", "credentials": map[string]string{"access_key_id": "id", "secret_access_key": "secret", "session_token": "token"}, "expires_at": "2026-01-01T01:00:00Z", "intent_expires_at": "2099-01-01T01:00:00Z", "binding": map[string]any{"manifest_sha256": pkg.ManifestSHA256, "archive_sha256": pkg.ArchiveSHA256, "archive_size_bytes": pkg.ArchiveSizeBytes}}}})
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"run_id": "bdd_00000000-0000-7000-8000-000000000001", "status": "uploading", "source_run_id": pkg.Run.SourceRunID, "corpus_key": pkg.Run.Corpus.Key, "created_at": "2026-01-01T00:00:00Z", "diagnostics": []any{}, "upload": map[string]any{"bucket": "bucket", "key": "staging/key", "region": "us-west-2", "credentials": map[string]string{"access_key_id": "id", "secret_access_key": "secret", "session_token": "token"}, "expires_at": "2099-01-01T00:15:00Z", "intent_expires_at": "2099-01-01T01:00:00Z", "binding": map[string]any{"manifest_sha256": pkg.ManifestSHA256, "archive_sha256": pkg.ArchiveSHA256, "archive_size_bytes": pkg.ArchiveSizeBytes}}}})
 		case "/api/v1/repos/repo_test/attest/runs/bdd_00000000-0000-7000-8000-000000000001/completions":
 			completions++
 			if r.ContentLength != 0 || r.Header.Get("Content-Type") != "" {
@@ -179,7 +179,7 @@ func TestPublisherUsesInitialGrantWithoutRenewal(t *testing.T) {
 
 func TestPublisherResumesCompletedObjectByCompletingUploadingRun(t *testing.T) {
 	pkg := testPackage(t)
-	initial := Grant{Binding: Binding{
+	initial := Grant{Bucket: "bucket", Key: "staging/key", Region: "us-west-2", Credentials: Credentials{AccessKeyID: "id", SecretAccessKey: "secret", SessionToken: "token"}, ExpiresAt: time.Date(2099, 1, 1, 0, 15, 0, 0, time.UTC), Binding: Binding{
 		ManifestSHA256:   pkg.ManifestSHA256,
 		ArchiveSHA256:    pkg.ArchiveSHA256,
 		ArchiveSizeBytes: pkg.ArchiveSizeBytes,
@@ -204,12 +204,12 @@ func TestPublisherResumesCompletedObjectByCompletingUploadingRun(t *testing.T) {
 		case "/api/v1/repos/repo_test/attest/runs/" + journal.RunID:
 			gets++
 			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
-				"run_id": journal.RunID, "status": "uploading", "source_run_id": pkg.Run.SourceRunID,
+				"run_id": journal.RunID, "status": "uploading", "source_run_id": pkg.Run.SourceRunID, "corpus_key": pkg.Run.Corpus.Key, "created_at": "2026-01-01T00:00:00Z", "diagnostics": []any{},
 			}})
 		case "/api/v1/repos/repo_test/attest/runs/" + journal.RunID + "/completions":
 			completions++
 			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
-				"run_id": journal.RunID, "status": "published", "source_run_id": pkg.Run.SourceRunID,
+				"run_id": journal.RunID, "status": "published", "source_run_id": pkg.Run.SourceRunID, "corpus_key": pkg.Run.Corpus.Key, "created_at": "2026-01-01T00:00:00Z", "diagnostics": []any{},
 			}})
 		default:
 			t.Errorf("unexpected request %s", r.URL.Path)
@@ -240,18 +240,18 @@ func TestPublisherResumesAfterControlCompletionFailure(t *testing.T) {
 		case "/api/v1/repos/repo_test/attest/runs":
 			creates++
 			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
-				"run_id": "bdd_00000000-0000-7000-8000-000000000001", "status": "uploading", "source_run_id": pkg.Run.SourceRunID,
+				"run_id": "bdd_00000000-0000-7000-8000-000000000001", "status": "uploading", "source_run_id": pkg.Run.SourceRunID, "corpus_key": pkg.Run.Corpus.Key, "created_at": "2026-01-01T00:00:00Z", "diagnostics": []any{},
 				"upload": map[string]any{
 					"bucket": "bucket", "key": "staging/key", "region": "us-west-2",
-					"credentials":       map[string]string{"access_key_id": "id", "secret_access_key": "secret", "session_token": "token"},
-					"intent_expires_at": "2099-01-01T01:00:00Z",
-					"binding":           map[string]any{"manifest_sha256": pkg.ManifestSHA256, "archive_sha256": pkg.ArchiveSHA256, "archive_size_bytes": pkg.ArchiveSizeBytes},
+					"credentials": map[string]string{"access_key_id": "id", "secret_access_key": "secret", "session_token": "token"},
+					"expires_at":  "2099-01-01T00:15:00Z", "intent_expires_at": "2099-01-01T01:00:00Z",
+					"binding": map[string]any{"manifest_sha256": pkg.ManifestSHA256, "archive_sha256": pkg.ArchiveSHA256, "archive_size_bytes": pkg.ArchiveSizeBytes},
 				},
 			}})
 		case "/api/v1/repos/repo_test/attest/runs/bdd_00000000-0000-7000-8000-000000000001":
 			gets++
 			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
-				"run_id": "bdd_00000000-0000-7000-8000-000000000001", "status": "uploading", "source_run_id": pkg.Run.SourceRunID,
+				"run_id": "bdd_00000000-0000-7000-8000-000000000001", "status": "uploading", "source_run_id": pkg.Run.SourceRunID, "corpus_key": pkg.Run.Corpus.Key, "created_at": "2026-01-01T00:00:00Z", "diagnostics": []any{},
 			}})
 		case "/api/v1/repos/repo_test/attest/runs/bdd_00000000-0000-7000-8000-000000000001/completions":
 			completions++
@@ -260,7 +260,7 @@ func TestPublisherResumesAfterControlCompletionFailure(t *testing.T) {
 				return
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
-				"run_id": "bdd_00000000-0000-7000-8000-000000000001", "status": "published", "source_run_id": pkg.Run.SourceRunID,
+				"run_id": "bdd_00000000-0000-7000-8000-000000000001", "status": "published", "source_run_id": pkg.Run.SourceRunID, "corpus_key": pkg.Run.Corpus.Key, "created_at": "2026-01-01T00:00:00Z", "diagnostics": []any{},
 			}})
 		default:
 			t.Errorf("unexpected request %s", r.URL.Path)
@@ -318,7 +318,7 @@ func TestPublisherCompletedJournalDoesNotRecompleteTerminalRun(t *testing.T) {
 				switch r.URL.Path {
 				case "/api/v1/repos/repo_test/attest/runs/" + journal.RunID:
 					_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
-						"run_id": journal.RunID, "status": status, "source_run_id": pkg.Run.SourceRunID,
+						"run_id": journal.RunID, "status": status, "source_run_id": pkg.Run.SourceRunID, "corpus_key": pkg.Run.Corpus.Key, "created_at": "2026-01-01T00:00:00Z", "diagnostics": []any{},
 					}})
 				case "/api/v1/repos/repo_test/attest/runs/" + journal.RunID + "/completions":
 					completions++
@@ -351,7 +351,7 @@ func TestPublisherResumeRejectsChangedRenewalBeforeMultipart(t *testing.T) {
 		{"deadline", func(grant *Grant) { grant.IntentExpiresAt = grant.IntentExpiresAt.Add(time.Hour) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			initial := Grant{Binding: Binding{
+			initial := Grant{Bucket: "bucket", Key: "staging/key", Region: "us-west-2", Credentials: Credentials{AccessKeyID: "id", SecretAccessKey: "secret", SessionToken: "token"}, ExpiresAt: time.Date(2099, 1, 1, 0, 15, 0, 0, time.UTC), Binding: Binding{
 				ManifestSHA256:   pkg.ManifestSHA256,
 				ArchiveSHA256:    pkg.ArchiveSHA256,
 				ArchiveSizeBytes: pkg.ArchiveSizeBytes,

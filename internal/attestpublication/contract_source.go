@@ -4,7 +4,7 @@ const (
 	// The contract was exported from an uncommitted monorepo worktree based on
 	// this revision. The manifest digest, rather than the base revision, is the
 	// authoritative identity until sageox/attest has a versioned module release.
-	contractSourceRevision = "034a600f48e32c79070b32791912fd5c5b05cda1"
+	contractSourceRevision = "f923563a43518e72823c17165c7155bcd519c28e"
 	contractSourceDirty    = true
-	contractManifestSHA    = "9a0cd90b6cab7f1fc84d208c4286eb4e0b799c28445211fcfe7ae5f05a12191b"
+	contractManifestSHA    = "ac8ec31f29649b882a116a10b1af48af85431a497b704c92792be91390e39129"
 )

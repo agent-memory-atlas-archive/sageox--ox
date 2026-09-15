@@ -20,6 +20,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
+	"github.com/sageox/ox/internal/fileutil"
+	"golang.org/x/sync/errgroup"
 )
 
 const (
@@ -71,18 +73,11 @@ func LoadJournal(path string) (Journal, error) {
 	return journal, nil
 }
 func SaveJournal(path string, journal Journal) error {
-	raw, err := json.Marshal(journal)
-	if err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	temporary := path + ".tmp"
-	if err := os.WriteFile(temporary, raw, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(temporary, path)
+	// Use the shared exclusive-temp writer; predictable .tmp names can be symlinks.
+	return fileutil.AtomicWriteJSON(path, journal, 0o600)
 }
 
 func NewJournal(run Run, archive Package) (Journal, error) {
@@ -211,65 +206,51 @@ func missingParts(size int64, completed []CompletedPart) []missingPart {
 	return result
 }
 func uploadMissing(ctx context.Context, transfer Multipart, grant Grant, file *os.File, work []missingPart, journal *Journal, journalPath string) error {
+	group, uploadCtx := errgroup.WithContext(ctx)
 	jobs := make(chan missingPart)
-	results := make(chan CompletedPart, len(work))
-	errCh := make(chan error, 1)
-	var workers sync.WaitGroup
-	for range partWorkers {
-		workers.Add(1)
-		go func() {
-			defer workers.Done()
-			for part := range jobs {
-				reader := io.NewSectionReader(file, part.offset, part.size)
-				result, err := transfer.Upload(ctx, grant, journal.UploadID, part.number, reader, part.size)
-				if err != nil {
-					select {
-					case errCh <- err:
-					default:
-					}
-					return
-				}
-				results <- result
-			}
-		}()
-	}
-	go func() {
+	var journalMu sync.Mutex
+	group.Go(func() error {
 		defer close(jobs)
 		for _, part := range work {
 			select {
 			case jobs <- part:
-			case <-ctx.Done():
-				return
+			case <-uploadCtx.Done():
+				return uploadCtx.Err()
 			}
 		}
-	}()
-	done := make(chan struct{})
-	go func() { workers.Wait(); close(done) }()
-	for remaining := len(work); remaining > 0; {
-		select {
-		case err := <-errCh:
-			return err
-		case part := <-results:
-			journal.Parts = reconcileParts(journal.Parts, []CompletedPart{part})
-			if err := SaveJournal(journalPath, *journal); err != nil {
-				return err
-			}
-			remaining--
-		case <-done:
-			if remaining > 0 {
+		return nil
+	})
+	for range partWorkers {
+		group.Go(func() error {
+			for {
 				select {
-				case err := <-errCh:
-					return err
-				default:
-					return errors.New("multipart workers stopped before all parts completed")
+				case <-uploadCtx.Done():
+					return uploadCtx.Err()
+				case part, ok := <-jobs:
+					if !ok {
+						return nil
+					}
+					reader := io.NewSectionReader(file, part.offset, part.size)
+					completed, err := transfer.Upload(uploadCtx, grant, journal.UploadID, part.number, reader, part.size)
+					if err != nil {
+						return err
+					}
+					journalMu.Lock()
+					journal.Parts = reconcileParts(journal.Parts, []CompletedPart{completed})
+					err = SaveJournal(journalPath, *journal)
+					journalMu.Unlock()
+					if err != nil {
+						return err
+					}
 				}
 			}
-		case <-ctx.Done():
-			return ctx.Err()
-		}
+		})
 	}
-	return nil
+	// Wait includes the producer and every reader. A credential retry cannot start
+	// (and the caller cannot close the archive) until the old attempt has stopped.
+	return group.Wait()
 }
+
 func reconcileParts(local, remote []CompletedPart) []CompletedPart {
 	values := map[int32]CompletedPart{}
 	for _, part := range local {
