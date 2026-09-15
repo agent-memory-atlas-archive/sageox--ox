@@ -35,7 +35,8 @@ func hostedLedgerSelected(repo string) bool {
 // the hosted checkout, which is exactly the influence this path exists to deny.
 func hostedLedgerRepoArg(args []string) string {
 	repo := ""
-	for i, arg := range args {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
 		if arg == "--" {
 			break
 		}
@@ -44,7 +45,12 @@ func hostedLedgerRepoArg(args []string) string {
 			continue
 		}
 		if !split && i+1 < len(args) {
-			value = args[i+1]
+			// Step past the value. pflag hands the next token to --repo
+			// whatever it is, so a "--" consumed here is this flag's value and
+			// not the positional separator; treating it as the separator would
+			// abandon the scan and miss a later --repo that pflag does bind.
+			i++
+			value = args[i]
 		}
 		repo = value
 	}

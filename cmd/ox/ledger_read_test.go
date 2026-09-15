@@ -467,6 +467,11 @@ func TestHostedLedgerSelection(t *testing.T) {
 		{[]string{"session", "list", "--repo", "/local/path", "--repo", readSyncTestRepoID}, true},
 		{[]string{"glance", "--repo", "/local/path", "--repo=" + readSyncTestRepoID}, true},
 		{[]string{"glance", "--repo", readSyncTestRepoID, "--repo", "/local/path"}, false},
+		// pflag hands "--" to the first --repo as its VALUE, then binds the
+		// last one. Reading "--" as the positional separator would stop the
+		// scan and route a hosted read through the project prelude.
+		{[]string{"session", "list", "--repo", "--", "--repo", readSyncTestRepoID}, true},
+		{[]string{"glance", "--repo=--", "--repo", readSyncTestRepoID}, true},
 	} {
 		require.Equal(t, tc.want, headlessLedgerReadRequested(tc.args), "%v", tc.args)
 	}
