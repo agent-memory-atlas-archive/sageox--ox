@@ -87,6 +87,7 @@ The sample paths and counts are illustrative; the returned coverage describes th
 | `hydration.state` | `complete`, `missing`, or `unknown`. |
 | `hydration.required`, `hydration.completed` | Required current-worktree LFS objects and successfully verified objects. |
 | `error_class` | Sanitized failure category, omitted when none. |
+| `error_detail` | The object a failure is about, omitted when no single object is identifiable. See [Failure detail](#failure-detail). |
 
 | Exit | Contract |
 | --- | --- |
@@ -97,6 +98,54 @@ The sample paths and counts are illustrative; the returned coverage describes th
 Failure categories are `invalid_arguments`, `denied`, `unavailable`, `missing_ledger`, `interrupted`, `dirty`, `missing_hydration`, `incomplete_history`, `incomplete_coverage`, `identity_mismatch`, and `git_failed`. Authentication failures, including a missing selected TAT, use `denied`. A deadline or canceled lock wait uses `interrupted`. `unavailable` also covers discovery transport failure and an unusable backend response. Consumers must tolerate additional failure categories in future releases.
 
 Discovery failure does not inspect an existing checkout and returns `ready: false`. Consumers that need offline recovery may run `--check` separately, subject to their authorization policy.
+
+### Failure detail
+
+Many distinct conditions share one `error_class` — a refused object, a malformed grant, and a corrupt download are all `missing_hydration`. A failure that is about one object therefore also carries `error_detail`, so an operator can act on it instead of correlating server request logs against object storage by hand. This is additive within `schema_version: 1`: `error_class` keeps its published vocabulary and consumers that match only on the class are unaffected.
+
+```json
+{
+  "error_class": "missing_hydration",
+  "error_detail": {
+    "reason": "object_refused",
+    "path": "sessions/2026-09-08-planning/session.md",
+    "oid": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+    "server_code": 404
+  }
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `reason` | Which condition failed. Always present. |
+| `path` | Repo-relative path of the file the object materializes. |
+| `oid` | Bare SHA-256 object identifier. |
+| `expected_oid` | Object identity the pointer should have named. |
+| `expected_size`, `actual_size` | Pointer-declared and observed sizes, in bytes. |
+| `server_code` | Status the server reported for this object. |
+
+| `reason` | `error_class` | Condition |
+| --- | --- | --- |
+| `malformed_pointer` | `missing_hydration` | An LFS pointer in the checkout cannot be parsed. |
+| `nested_stub` | `missing_hydration` | A materialized file's content is itself a pointer, and not the one HEAD commits. |
+| `empty_object_oid_mismatch` | `missing_hydration` | A size-0 pointer names an object other than the empty one. |
+| `shared_object_size_conflict` | `missing_hydration` | Two files name one object with different sizes. |
+| `batch_response_incomplete` | `missing_hydration` | The batch response holds fewer objects than the batch. |
+| `batch_object_unrequested` | `missing_hydration` | The batch response holds an object that was not requested. |
+| `batch_object_duplicated` | `missing_hydration` | The batch response repeats an object. |
+| `object_refused` | `missing_hydration`, `denied` | The server reported a per-object error. |
+| `object_size_mismatch` | `missing_hydration` | The granted size differs from the pointer's. |
+| `object_missing_actions` | `missing_hydration` | The grant carries no actions. |
+| `object_missing_download_action` | `missing_hydration` | The grant carries actions but no download. |
+| `download_refused` | `missing_hydration`, `denied` | The object download returned an HTTP failure. |
+| `download_failed` | `missing_hydration` | The object download failed, or its content did not verify. |
+| `download_stat_failed` | `missing_hydration` | The downloaded object could not be inspected locally. |
+| `downloaded_size_mismatch` | `missing_hydration` | The downloaded bytes do not match the pointer's size. |
+| `object_not_materialized` | `missing_hydration` | Verification found a covered file still left as a stub. |
+
+Detail obeys the same redaction rules as the rest of the result: no credential, credential-bearing URL, response body, or subprocess output. There is no server message field. The client replaces a read route's per-object error prose with the status text for that error's code before any caller sees it, so a message field could only restate `server_code` and would misrepresent a client-generated string as the server's own.
+
+Consumers must tolerate additional reasons, and an absent `error_detail` on failures that name no single object.
 
 ## Remote evidence and local recovery
 

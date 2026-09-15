@@ -22,6 +22,8 @@ import (
 
 const readRepoID = "repo_01936d5a-0000-7abc-8def-0123456789ab"
 
+const readTestToken = "oxt_test_1ljPfr"
+
 type readFixture struct {
 	opts   ReadSyncOptions
 	source string
@@ -65,7 +67,7 @@ func newReadFixture(t *testing.T, lfsHandler ...http.HandlerFunc) *readFixture {
 	backend := &cgi.Handler{Path: filepath.Join(readTestGit(t, root, "--exec-path"), "git-http-backend"), Env: []string{"GIT_PROJECT_ROOT=" + root, "GIT_HTTP_EXPORT_ALL=1"}}
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		u, p, ok := r.BasicAuth()
-		if f.denied.Load() || !ok || u != "ox" || p != "oxt_test_1ljPfr" {
+		if f.denied.Load() || !ok || u != "ox" || p != readTestToken {
 			w.Header().Set("WWW-Authenticate", `Basic realm="ledger"`)
 			w.WriteHeader(401)
 			return
@@ -96,7 +98,7 @@ func newReadFixture(t *testing.T, lfsHandler ...http.HandlerFunc) *readFixture {
 	require.NoError(t, os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\nexec "+quote(git)+" -c "+quote("http.sslCAInfo="+cert)+" \"$@\"\n"), 0700))
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("SAGEOX_ENDPOINT", server.URL)
-	t.Setenv("SAGEOX_TOKEN", "oxt_test_1ljPfr")
+	t.Setenv("SAGEOX_TOKEN", readTestToken)
 	old := gitserver.DefaultHelperCommand()
 	gitserver.SetHelperCommand(`!f() { printf 'username=ox\npassword=%s\n\n' "$SAGEOX_TOKEN"; }; f`)
 	t.Cleanup(func() { gitserver.SetHelperCommand(old) })
@@ -132,7 +134,7 @@ func TestReadSyncNativeLifecycle(t *testing.T) {
 	require.True(t, local.Ready, "%+v", local)
 	require.Equal(t, warm.LastSuccessfulSync, local.LastSuccessfulSync)
 	f.denied.Store(false)
-	t.Setenv("SAGEOX_TOKEN", "oxt_test_1ljPfr")
+	t.Setenv("SAGEOX_TOKEN", readTestToken)
 
 	file := filepath.Join(f.opts.Path, "sessions/old/session.md")
 	require.NoError(t, os.WriteFile(file, []byte("local work\n"), 0600))
