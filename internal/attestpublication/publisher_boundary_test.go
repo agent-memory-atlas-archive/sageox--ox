@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -74,11 +75,11 @@ func TestPublisherBoundaryPendingJournalReplaysOneCreate(t *testing.T) {
 				t.Fatal(err)
 			}
 			grant := boundaryGrant(pkg)
-			var creates, completions int
+			var creates, completions atomic.Int32
 			client := boundaryClient(t, func(w http.ResponseWriter, r *http.Request) {
 				switch {
 				case strings.HasSuffix(r.URL.Path, "/runs"):
-					creates++
+					creates.Add(1)
 					if r.Header.Get("Idempotency-Key") != journal.IdempotencyKey {
 						t.Error("replayed create changed the persisted idempotency key")
 					}
@@ -88,7 +89,7 @@ func TestPublisherBoundaryPendingJournalReplaysOneCreate(t *testing.T) {
 						boundaryReply(t, w, boundaryRun(pkg, "published", nil))
 					}
 				case strings.HasSuffix(r.URL.Path, "/completions"):
-					completions++
+					completions.Add(1)
 					boundaryReply(t, w, boundaryRun(pkg, "published", nil))
 				default:
 					t.Errorf("unexpected request %s", r.URL.Path)
@@ -97,11 +98,11 @@ func TestPublisherBoundaryPendingJournalReplaysOneCreate(t *testing.T) {
 			})
 			transfer := &fakeMultipart{}
 			result, err := (Publisher{Control: client, Transfer: transfer}).Publish(context.Background(), "repo_test", path, pkg)
-			if err != nil || result.Run.Status != "published" || creates != 1 {
-				t.Fatalf("replay result=%+v creates=%d err=%v", result.Run, creates, err)
+			if err != nil || result.Run.Status != "published" || creates.Load() != 1 {
+				t.Fatalf("replay result=%+v creates=%d err=%v", result.Run, creates.Load(), err)
 			}
-			if transfer.completed != upload || completions != map[bool]int{true: 1, false: 0}[upload] {
-				t.Fatalf("replay repeated or skipped transfer: completed=%t control completions=%d", transfer.completed, completions)
+			if transfer.completed != upload || completions.Load() != map[bool]int32{true: 1, false: 0}[upload] {
+				t.Fatalf("replay repeated or skipped transfer: completed=%t control completions=%d", transfer.completed, completions.Load())
 			}
 			saved, err := LoadJournal(path)
 			if err != nil || !saved.Completed || saved.RunID != boundaryRunID || saved.IdempotencyKey != journal.IdempotencyKey {
@@ -182,15 +183,15 @@ func TestPublisherBoundaryResumeControlFailuresPreserveJournal(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			var calls int
+			var calls atomic.Int32
 			client := boundaryClient(t, func(w http.ResponseWriter, _ *http.Request) {
-				calls++
+				calls.Add(1)
 				boundaryError(w, http.StatusForbidden)
 			})
 			_, err = (Publisher{Control: client, Transfer: &fakeMultipart{}}).Publish(context.Background(), "repo_test", path, pkg)
 			var apiErr *APIError
-			if !errors.As(err, &apiErr) || apiErr.Status != http.StatusForbidden || calls != 1 {
-				t.Fatalf("resume swallowed or retried permission failure: calls=%d err=%v", calls, err)
+			if !errors.As(err, &apiErr) || apiErr.Status != http.StatusForbidden || calls.Load() != 1 {
+				t.Fatalf("resume swallowed or retried permission failure: calls=%d err=%v", calls.Load(), err)
 			}
 			after, err := os.ReadFile(path)
 			if err != nil || string(before) != string(after) {
@@ -249,13 +250,13 @@ func TestPublisherBoundaryExpiredCredentialRecovery(t *testing.T) {
 				first = fmt.Errorf("list staging upload: %w", &smithy.GenericAPIError{Code: tc.code, Message: "upload rejected"})
 			}
 			transfer := &boundaryMultipart{listErrors: []error{first, tc.retryFailure}}
-			var renewals, completions int
+			var renewals, completions atomic.Int32
 			client := boundaryClient(t, func(w http.ResponseWriter, r *http.Request) {
 				switch {
 				case strings.HasSuffix(r.URL.Path, "/runs"):
 					boundaryReply(t, w, boundaryRun(pkg, "uploading", &grant))
 				case strings.HasSuffix(r.URL.Path, "/upload-grants"):
-					renewals++
+					renewals.Add(1)
 					if tc.renewStatus != 0 {
 						boundaryError(w, tc.renewStatus)
 						return
@@ -267,7 +268,7 @@ func TestPublisherBoundaryExpiredCredentialRecovery(t *testing.T) {
 					}
 					boundaryReply(t, w, renewed)
 				case strings.HasSuffix(r.URL.Path, "/completions"):
-					completions++
+					completions.Add(1)
 					if tc.completionStatus != 0 {
 						boundaryError(w, tc.completionStatus)
 						return
@@ -288,8 +289,8 @@ func TestPublisherBoundaryExpiredCredentialRecovery(t *testing.T) {
 				t.Fatalf("recovery failed: result=%+v err=%v", result.Run, err)
 			}
 			wantRenewal := tc.code != "" && tc.code != "AccessDenied"
-			if renewals != map[bool]int{true: 1, false: 0}[wantRenewal] {
-				t.Fatalf("renewals=%d for error %v", renewals, first)
+			if renewals.Load() != map[bool]int32{true: 1, false: 0}[wantRenewal] {
+				t.Fatalf("renewals=%d for error %v", renewals.Load(), first)
 			}
 			if wantRenewal && tc.renewStatus == 0 && !tc.changedDeadline {
 				if len(transfer.grants) != 2 || transfer.grants[1].Credentials.AccessKeyID != "renewed" || transfer.grants[1].Key != grant.Key {
@@ -297,11 +298,11 @@ func TestPublisherBoundaryExpiredCredentialRecovery(t *testing.T) {
 				}
 			}
 			if tc.renewStatus != 0 || tc.changedDeadline {
-				if completions != 0 || len(transfer.grants) != 1 {
+				if completions.Load() != 0 || len(transfer.grants) != 1 {
 					t.Fatal("failed renewal continued into upload or control completion")
 				}
-			} else if completions != 1 {
-				t.Fatalf("completion calls=%d, want 1", completions)
+			} else if completions.Load() != 1 {
+				t.Fatalf("completion calls=%d, want 1", completions.Load())
 			}
 			journal, loadErr := LoadJournal(path)
 			if loadErr != nil || journal.RunID != boundaryRunID || journal.Binding != grant.Binding {
@@ -319,13 +320,14 @@ func TestPublisherBoundaryCreateRecoveryIsBounded(t *testing.T) {
 	for _, failures := range []int{1, 3} {
 		t.Run(fmt.Sprintf("failures=%d", failures), func(t *testing.T) {
 			pkg := testPackage(t)
-			var calls, sleeps int
+			var calls atomic.Int32
+			var sleeps int
 			client := boundaryClient(t, func(w http.ResponseWriter, r *http.Request) {
-				calls++
+				calls.Add(1)
 				if r.Header.Get("Idempotency-Key") != "durable-create-key" {
 					t.Error("create retry changed identity")
 				}
-				if calls <= failures {
+				if calls.Load() <= int32(failures) {
 					boundaryError(w, http.StatusServiceUnavailable)
 					return
 				}
@@ -334,13 +336,13 @@ func TestPublisherBoundaryCreateRecoveryIsBounded(t *testing.T) {
 			publisher := Publisher{Control: client, Sleep: func(time.Duration) { sleeps++ }}
 			run, err := publisher.createWithRecovery(context.Background(), "repo_test", "durable-create-key", createRequest(pkg))
 			if failures == 1 {
-				if err != nil || run.Status != "published" || calls != 2 || sleeps != 1 {
-					t.Fatalf("transient failure did not recover: run=%+v calls=%d sleeps=%d err=%v", run, calls, sleeps, err)
+				if err != nil || run.Status != "published" || calls.Load() != 2 || sleeps != 1 {
+					t.Fatalf("transient failure did not recover: run=%+v calls=%d sleeps=%d err=%v", run, calls.Load(), sleeps, err)
 				}
 			} else {
 				var apiErr *APIError
-				if !errors.As(err, &apiErr) || apiErr.Status != http.StatusServiceUnavailable || calls != 3 {
-					t.Fatalf("unbounded or hidden create failure: calls=%d err=%v", calls, err)
+				if !errors.As(err, &apiErr) || apiErr.Status != http.StatusServiceUnavailable || calls.Load() != 3 {
+					t.Fatalf("unbounded or hidden create failure: calls=%d err=%v", calls.Load(), err)
 				}
 			}
 		})
@@ -390,9 +392,9 @@ func TestPublisherBoundaryJournalWriteFailureStopsProgress(t *testing.T) {
 			if mode == "reconciled-upload" {
 				transfer.listErrors = []error{errors.New("multipart response lost")}
 			}
-			var calls int
+			var calls atomic.Int32
 			client := boundaryClient(t, func(w http.ResponseWriter, r *http.Request) {
-				calls++
+				calls.Add(1)
 				completion := strings.HasSuffix(r.URL.Path, "/completions")
 				if completion || mode != "reconciled-upload" {
 					// A directory at the journal name fails atomic replacement on all platforms.
@@ -413,12 +415,12 @@ func TestPublisherBoundaryJournalWriteFailureStopsProgress(t *testing.T) {
 			if err == nil {
 				t.Fatal("publication succeeded despite its journal being unwritable")
 			}
-			wantCalls := 1
+			wantCalls := int32(1)
 			if mode == "reconciled-upload" {
 				wantCalls = 2
 			}
-			if calls != wantCalls || transfer.completed {
-				t.Fatalf("publication continued after persistence failure: calls=%d transfer completed=%t", calls, transfer.completed)
+			if calls.Load() != wantCalls || transfer.completed {
+				t.Fatalf("publication continued after persistence failure: calls=%d transfer completed=%t", calls.Load(), transfer.completed)
 			}
 		})
 	}
@@ -465,11 +467,11 @@ func TestPublisherBoundaryBoundJournalRenewsBeforeTransfer(t *testing.T) {
 	if err := SaveJournal(path, journal); err != nil {
 		t.Fatal(err)
 	}
-	var renewals int
+	var renewals atomic.Int32
 	client := boundaryClient(t, func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/upload-grants"):
-			renewals++
+			renewals.Add(1)
 			grant.Credentials.AccessKeyID = "renewed"
 			boundaryReply(t, w, grant)
 		case strings.HasSuffix(r.URL.Path, "/completions"):
@@ -481,8 +483,8 @@ func TestPublisherBoundaryBoundJournalRenewsBeforeTransfer(t *testing.T) {
 	})
 	transfer := &boundaryMultipart{}
 	result, err := (Publisher{Control: client, Transfer: transfer}).Publish(context.Background(), "repo_test", path, pkg)
-	if err != nil || result.Run.Status != "published" || renewals != 1 || len(transfer.grants) != 1 || transfer.grants[0].Credentials.AccessKeyID != "renewed" {
-		t.Fatalf("bound resume failed: result=%+v renewals=%d grants=%+v err=%v", result.Run, renewals, transfer.grants, err)
+	if err != nil || result.Run.Status != "published" || renewals.Load() != 1 || len(transfer.grants) != 1 || transfer.grants[0].Credentials.AccessKeyID != "renewed" {
+		t.Fatalf("bound resume failed: result=%+v renewals=%d grants=%+v err=%v", result.Run, renewals.Load(), transfer.grants, err)
 	}
 }
 
@@ -491,16 +493,16 @@ func TestPublisherBoundaryCreateBackoffHonorsCancellation(t *testing.T) {
 	pkg := testPackage(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	var calls int
+	var calls atomic.Int32
 	client := boundaryClient(t, func(w http.ResponseWriter, _ *http.Request) {
-		calls++
+		calls.Add(1)
 		// Cancel after the response is processed, while the real one-second backoff waits.
 		timer := time.AfterFunc(25*time.Millisecond, cancel)
 		t.Cleanup(func() { timer.Stop() })
 		boundaryError(w, http.StatusServiceUnavailable)
 	})
 	_, err := (Publisher{Control: client}).createWithRecovery(ctx, "repo_test", "durable-key", createRequest(pkg))
-	if !errors.Is(err, context.Canceled) || calls != 1 {
-		t.Fatalf("retry backoff ignored cancellation: calls=%d err=%v", calls, err)
+	if !errors.Is(err, context.Canceled) || calls.Load() != 1 {
+		t.Fatalf("retry backoff ignored cancellation: calls=%d err=%v", calls.Load(), err)
 	}
 }
