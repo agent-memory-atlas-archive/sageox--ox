@@ -12,11 +12,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/sageox/ox/internal/auth"
+	"github.com/sageox/ox/internal/gitserver"
+	"github.com/sageox/ox/internal/gitutil"
 	"github.com/sageox/ox/internal/lfs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -993,7 +996,266 @@ func TestReadSyncLFSColdFailureNeverPublishesCheckout(t *testing.T) {
 	require.Equal(t, "missing_hydration", result.ErrorClass)
 	require.Nil(t, result.LastSuccessfulSync)
 	require.NoDirExists(t, f.opts.Path)
-	staging, err := filepath.Glob(filepath.Join(filepath.Dir(f.opts.Path), ".ox-read-clone-*"))
+	// The stage survives so the next attempt resumes from it, and carries only
+	// the invalidated receipt this attempt wrote before hydration.
+	receipt := loadReadReceiptAt(readStagePath(f.opts.Path), f.opts.Path, f.opts.RepoID, f.opts.Endpoint)
+	require.NotNil(t, receipt)
+	require.False(t, receipt.Ready)
+	require.Empty(t, receipt.Head)
+}
+
+// coldReadStageFixture commits three LFS objects under sessions/cold/ and serves
+// them, refusing the last one while refuse is set. It reports how many times each
+// object was actually transferred and what the most recent batch asked for.
+type coldReadStageFixture struct {
+	*readFixture
+	contents  map[string][]byte
+	paths     map[string]string
+	refused   string
+	refuse    atomic.Bool
+	downloads map[string]*atomic.Int32
+	mu        sync.Mutex
+	lastBatch []string
+}
+
+func newColdReadStageFixture(t *testing.T) *coldReadStageFixture {
+	t.Helper()
+	c := &coldReadStageFixture{contents: map[string][]byte{}, paths: map[string]string{}, downloads: map[string]*atomic.Int32{}}
+	c.refuse.Store(true)
+	for _, name := range []string{"a", "b", "c"} {
+		content := []byte("cold clone object " + name + "\n")
+		oid := lfs.ComputeOID(content)
+		c.contents[oid], c.paths["sessions/cold/"+name+".md"], c.downloads[oid] = content, oid, &atomic.Int32{}
+	}
+	// Hydration follows tree order, so refusing "c" leaves "a" and "b" already
+	// transferred when the attempt fails.
+	c.refused = c.paths["sessions/cold/c.md"]
+	c.readFixture = newReadLFSFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/batch") {
+			var request struct {
+				Objects []lfs.BatchObject `json:"objects"`
+			}
+			assert.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+			response := lfs.BatchResponse{}
+			oids := make([]string, 0, len(request.Objects))
+			for _, object := range request.Objects {
+				oids = append(oids, object.OID)
+				response.Objects = append(response.Objects, lfs.BatchResponseObject{OID: object.OID, Size: object.Size, Actions: &lfs.Actions{Download: &lfs.Action{
+					Href: "https://" + r.Host + strings.TrimSuffix(r.URL.Path, "/batch") + "/" + object.OID,
+				}}})
+			}
+			c.mu.Lock()
+			c.lastBatch = oids
+			c.mu.Unlock()
+			assert.NoError(t, json.NewEncoder(w).Encode(response))
+			return
+		}
+		oid := filepath.Base(r.URL.Path)
+		content, ok := c.contents[oid]
+		if !assert.True(t, ok) {
+			http.NotFound(w, r)
+			return
+		}
+		c.downloads[oid].Add(1)
+		if oid == c.refused && c.refuse.Load() {
+			http.Error(w, "object refused", http.StatusInternalServerError)
+			return
+		}
+		_, _ = w.Write(content)
+	})
+	require.NoError(t, os.MkdirAll(filepath.Join(c.source, "sessions/cold"), 0700))
+	for path, oid := range c.paths {
+		pointer := lfs.FormatPointer("sha256:"+oid, int64(len(c.contents[oid])))
+		require.NoError(t, os.WriteFile(filepath.Join(c.source, path), []byte(pointer), 0600))
+	}
+	readTestGit(t, c.source, "add", "--", "sessions/cold")
+	readTestGit(t, c.source, "commit", "-m", "add cold clone objects")
+	readTestGit(t, c.bare, "fetch", c.source, "+refs/heads/main:refs/heads/main")
+	return c
+}
+
+func (c *coldReadStageFixture) transferred(name string) int32 {
+	return c.downloads[c.paths["sessions/cold/"+name+".md"]].Load()
+}
+
+func (c *coldReadStageFixture) requested() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastBatch
+}
+
+// Failure prevented: a cold clone that fails late in hydration takes its staging
+// directory with it, discarding every object already transferred. A ledger whose
+// hydration cannot finish in one attempt then never converges — each retry pays
+// the whole download again and still ends with an empty directory.
+func TestReadSyncColdHydrationFailureResumesTransferredObjects(t *testing.T) {
+	c := newColdReadStageFixture(t)
+	stage := readStagePath(c.opts.Path)
+
+	result := ReadSync(context.Background(), c.opts)
+	require.False(t, result.Ready)
+	require.Equal(t, "missing_hydration", result.ErrorClass)
+	require.NoDirExists(t, c.opts.Path, "an interrupted cold clone is never published")
+	for _, name := range []string{"a", "b"} {
+		actual, err := os.ReadFile(filepath.Join(stage, "sessions/cold/"+name+".md"))
+		require.NoError(t, err)
+		require.Equal(t, c.contents[c.paths["sessions/cold/"+name+".md"]], actual, name)
+	}
+	stub, err := os.ReadFile(filepath.Join(stage, "sessions/cold/c.md"))
 	require.NoError(t, err)
-	require.Empty(t, staging, "only the unpublished failed clone should be removed")
+	require.Equal(t, lfs.FormatPointer("sha256:"+c.refused, int64(len(c.contents[c.refused]))), string(stub))
+	receipt := loadReadReceiptAt(stage, c.opts.Path, c.opts.RepoID, c.opts.Endpoint)
+	require.NotNil(t, receipt, "the stage records the identity a resume must match")
+	require.False(t, receipt.Ready, "an interrupted stage is never reported ready")
+
+	result = ReadSync(context.Background(), c.opts)
+	require.Equal(t, "missing_hydration", result.ErrorClass, "%+v", result)
+	require.Equal(t, []string{c.refused}, c.requested(), "the retry requests only the object still missing")
+	require.Equal(t, int32(1), c.transferred("a"), "a verified object is never transferred again")
+	require.Equal(t, int32(1), c.transferred("b"))
+	require.Equal(t, int32(2), c.transferred("c"))
+
+	c.refuse.Store(false)
+	result = ReadSync(context.Background(), c.opts)
+	require.True(t, result.Ready, "%+v", result)
+	require.NotNil(t, result.LastSuccessfulSync)
+	require.NoDirExists(t, stage, "publishing consumes the stage")
+	for path, oid := range c.paths {
+		actual, err := os.ReadFile(filepath.Join(c.opts.Path, path))
+		require.NoError(t, err)
+		require.Equal(t, c.contents[oid], actual, path)
+	}
+	require.Equal(t, int32(1), c.transferred("a"))
+	require.Equal(t, int32(3), c.transferred("c"))
+}
+
+// Failure prevented: the stage path is derived from the checkout name, so a
+// directory ox never created can already sit there. Deleting it because the
+// name matched would destroy content this command does not own.
+func TestReadSyncColdStageRefusesForeignDirectory(t *testing.T) {
+	f := newReadFixture(t)
+	stage := readStagePath(f.opts.Path)
+	require.NoError(t, os.MkdirAll(filepath.Join(stage, "notes"), 0700))
+	require.NoError(t, os.WriteFile(filepath.Join(stage, "notes/keep.txt"), []byte("not ox's\n"), 0600))
+
+	result := ReadSync(context.Background(), f.opts)
+	require.False(t, result.Ready)
+	require.Equal(t, "dirty", result.ErrorClass)
+	require.NoDirExists(t, f.opts.Path, "a refusal publishes nothing")
+	kept, err := os.ReadFile(filepath.Join(stage, "notes/keep.txt"))
+	require.NoError(t, err)
+	require.Equal(t, "not ox's\n", string(kept))
+
+	// A Git checkout of something else is someone's repository, not ox's stage.
+	require.NoError(t, os.RemoveAll(stage))
+	require.NoError(t, os.MkdirAll(stage, 0700))
+	readTestGit(t, stage, "init", "-b", "main")
+	readTestGit(t, stage, "remote", "add", "origin", "https://elsewhere.invalid/mine.git")
+	require.NoError(t, os.WriteFile(filepath.Join(stage, "work.txt"), []byte("my commit\n"), 0600))
+	readTestGit(t, stage, "add", "--", "work.txt")
+	readTestGit(t, stage, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "local work")
+	head := readTestGit(t, stage, "rev-parse", "HEAD")
+
+	result = ReadSync(context.Background(), f.opts)
+	require.False(t, result.Ready)
+	require.Equal(t, "dirty", result.ErrorClass)
+	require.NoDirExists(t, f.opts.Path)
+	require.Equal(t, head, readTestGit(t, stage, "rev-parse", "HEAD"), "the local commit survives")
+
+	// An empty directory holds nothing to lose, so a cold clone claims it.
+	require.NoError(t, os.RemoveAll(stage))
+	require.NoError(t, os.MkdirAll(stage, 0700))
+	require.True(t, ReadSync(context.Background(), f.opts).Ready)
+	require.NoDirExists(t, stage, "publishing consumes the stage")
+}
+
+// Failure prevented: a budget that expires mid-attempt is read as evidence
+// against the stage, so the objects it holds are deleted — the loss this whole
+// mechanism exists to prevent. Ownership is what protects it: reading the stage's
+// origin needs a Git subprocess, and a canceled context cannot run one, so the
+// stage is refused rather than replaced. The checkout lock selects randomly
+// between a free lock and a canceled context, so this drives the locked body
+// directly to keep the cancellation deterministic.
+func TestReadSyncColdStageSurvivesCanceledInspection(t *testing.T) {
+	c := newColdReadStageFixture(t)
+	stage := readStagePath(c.opts.Path)
+	require.Equal(t, "missing_hydration", ReadSync(context.Background(), c.opts).ErrorClass)
+	require.DirExists(t, stage)
+
+	transport, err := gitserver.NewReadTransport(c.opts.Endpoint, c.opts.RepoID, c.opts.ReadURL)
+	require.NoError(t, err)
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	var result ReadSyncResult
+	require.NoError(t, gitutil.WithRepoLock(context.Background(), c.opts.Path, func() error {
+		result = readSyncLocked(canceled, c.opts, transport)
+		return nil
+	}))
+	require.False(t, result.Ready)
+	require.Equal(t, "interrupted", result.ErrorClass)
+	require.NoDirExists(t, c.opts.Path)
+	kept, err := os.ReadFile(filepath.Join(stage, "sessions/cold/a.md"))
+	require.NoError(t, err)
+	require.Equal(t, c.contents[c.paths["sessions/cold/a.md"]], kept, "cancellation is not evidence against the stage")
+	require.Equal(t, int32(1), c.transferred("a"), "nothing was transferred again")
+}
+
+func tamperReadStageReceipt(t *testing.T, stage string, mutate func(*readReceipt)) {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(stage, readReceiptRelative))
+	require.NoError(t, err)
+	var receipt readReceipt
+	require.NoError(t, json.Unmarshal(data, &receipt))
+	mutate(&receipt)
+	data, err = json.Marshal(receipt)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(stage, readReceiptRelative), data, 0600))
+}
+
+// Failure prevented: a resumed cold clone adopts a stage it cannot prove it
+// produced — content left by another repo identity, endpoint, or read URL, or a
+// worktree that no longer matches HEAD — and publishes it as this checkout.
+func TestReadSyncColdStageResumesOnlyProvenIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		damage func(*testing.T, string)
+	}{
+		{name: "foreign repo", damage: func(t *testing.T, stage string) {
+			tamperReadStageReceipt(t, stage, func(r *readReceipt) { r.RepoID = "repo_01936d5a-0001-7abc-8def-0123456789ab" })
+		}},
+		{name: "foreign endpoint", damage: func(t *testing.T, stage string) {
+			tamperReadStageReceipt(t, stage, func(r *readReceipt) { r.Endpoint = "https://elsewhere.invalid" })
+		}},
+		{name: "foreign read url", damage: func(t *testing.T, stage string) {
+			tamperReadStageReceipt(t, stage, func(r *readReceipt) { r.ReadURL = "https://elsewhere.invalid/ledger.git" })
+		}},
+		{name: "foreign destination", damage: func(t *testing.T, stage string) {
+			tamperReadStageReceipt(t, stage, func(r *readReceipt) { r.Path = filepath.Join(filepath.Dir(r.Path), "elsewhere") })
+		}},
+		{name: "no receipt", damage: func(t *testing.T, stage string) {
+			require.NoError(t, os.Remove(filepath.Join(stage, readReceiptRelative)))
+		}},
+		{name: "symlinked receipt directory", damage: func(t *testing.T, stage string) {
+			dir := filepath.Join(stage, ".sageox/cache/read-sync")
+			require.NoError(t, os.RemoveAll(dir))
+			require.NoError(t, os.Symlink(t.TempDir(), dir))
+		}},
+		{name: "damaged worktree", damage: func(t *testing.T, stage string) {
+			require.NoError(t, os.WriteFile(filepath.Join(stage, "sessions/cold/a.md"), []byte("not the object\n"), 0600))
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newColdReadStageFixture(t)
+			stage := readStagePath(c.opts.Path)
+			require.Equal(t, "missing_hydration", ReadSync(context.Background(), c.opts).ErrorClass)
+			require.Equal(t, int32(1), c.transferred("a"))
+			tc.damage(t, stage)
+
+			require.Equal(t, "missing_hydration", ReadSync(context.Background(), c.opts).ErrorClass)
+			require.Equal(t, int32(2), c.transferred("a"), "an unproven stage is discarded, not resumed")
+			receipt := loadReadReceiptAt(stage, c.opts.Path, c.opts.RepoID, c.opts.Endpoint)
+			require.NotNil(t, receipt, "the replacement stage is bound to this identity")
+			require.False(t, receipt.Ready)
+		})
+	}
 }
