@@ -762,6 +762,22 @@ func TestReadSyncColdStageRefusesForeignDirectory(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "not ox's\n", string(kept))
 
+	// A Git checkout of something else is someone's repository, not ox's stage.
+	require.NoError(t, os.RemoveAll(stage))
+	require.NoError(t, os.MkdirAll(stage, 0700))
+	readTestGit(t, stage, "init", "-b", "main")
+	readTestGit(t, stage, "remote", "add", "origin", "https://elsewhere.invalid/mine.git")
+	require.NoError(t, os.WriteFile(filepath.Join(stage, "work.txt"), []byte("my commit\n"), 0600))
+	readTestGit(t, stage, "add", "--", "work.txt")
+	readTestGit(t, stage, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "local work")
+	head := readTestGit(t, stage, "rev-parse", "HEAD")
+
+	result = ReadSync(context.Background(), f.opts)
+	require.False(t, result.Ready)
+	require.Equal(t, "dirty", result.ErrorClass)
+	require.NoDirExists(t, f.opts.Path)
+	require.Equal(t, head, readTestGit(t, stage, "rev-parse", "HEAD"), "the local commit survives")
+
 	// An empty directory holds nothing to lose, so a cold clone claims it.
 	require.NoError(t, os.RemoveAll(stage))
 	require.NoError(t, os.MkdirAll(stage, 0700))

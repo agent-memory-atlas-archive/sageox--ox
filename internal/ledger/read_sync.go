@@ -121,7 +121,7 @@ func readSyncLocked(ctx context.Context, opts ReadSyncOptions, transport *gitser
 				result.ErrorClass = "interrupted"
 				return result
 			}
-			if err := replaceReadStage(workPath); err != nil {
+			if err := replaceReadStage(ctx, transport, workPath, opts); err != nil {
 				result.ErrorClass = readErrorClass(ctx, err)
 				return result
 			}
@@ -246,14 +246,12 @@ func readStagePath(path string) string {
 }
 
 // replaceReadStage empties the staging path so a fresh clone can use it. The
-// path is derived from the checkout name, so something this command never
-// created can already be sitting there. Every state ox does leave at that path
-// is an empty directory or a Git checkout — `git clone` creates .git before it
-// writes anything else — so anything else is refused rather than deleted: the
-// name is not proof that ox produced what is there.
-func replaceReadStage(stage string) error {
+// path is derived from the checkout name, so content this command never created
+// can already be sitting there; ownedReadStage decides, and anything unproven is
+// refused rather than deleted.
+func replaceReadStage(ctx context.Context, transport *gitserver.ReadTransport, stage string, opts ReadSyncOptions) error {
 	if _, err := os.Lstat(stage); err == nil {
-		if !safeReadDirectory(stage) || (!Exists(stage) && !emptyReadDir(stage)) {
+		if !safeReadDirectory(stage) || !ownedReadStage(ctx, transport, stage, opts) {
 			return errors.New("dirty")
 		}
 		if err := os.RemoveAll(stage); err != nil {
@@ -265,9 +263,20 @@ func replaceReadStage(stage string) error {
 	return os.MkdirAll(stage, 0700)
 }
 
-func emptyReadDir(dir string) bool {
-	entries, err := os.ReadDir(dir)
-	return err == nil && len(entries) == 0
+// ownedReadStage reports whether ox can have produced what is at the stage path,
+// and is the only thing that authorizes deleting it. A stage ox created is either
+// still empty or a clone of this exact read URL: `git clone` records
+// remote.origin.url before it fetches any object, so even an attempt interrupted
+// mid-clone carries that record and stays replaceable without a human. A Git
+// checkout of anything else is someone else's, and its local commits are not
+// ox's to discard.
+func ownedReadStage(ctx context.Context, transport *gitserver.ReadTransport, stage string, opts ReadSyncOptions) bool {
+	if !Exists(stage) {
+		entries, err := os.ReadDir(stage)
+		return err == nil && len(entries) == 0
+	}
+	origin, err := runReadGit(ctx, transport, false, stage, "config", "--get", "remote.origin.url")
+	return err == nil && origin == opts.ReadURL
 }
 
 // resumableReadStage reports whether an earlier interrupted cold clone left a
