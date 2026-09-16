@@ -138,13 +138,6 @@ func readSyncLocked(ctx context.Context, opts ReadSyncOptions, transport *gitser
 		workPath = readStagePath(opts.Path)
 		clone = !resumableReadStage(ctx, transport, workPath, opts, dirs)
 		if clone {
-			// resumableReadStage also returns false when cancellation cut its
-			// inspection short. Refuse rather than delete a stage this attempt
-			// never finished reading.
-			if ctx.Err() != nil {
-				result.ErrorClass = "interrupted"
-				return result
-			}
 			if err := replaceReadStage(ctx, transport, workPath, opts); err != nil {
 				recordReadFailure(ctx, &result, err)
 				return result
@@ -296,6 +289,10 @@ func replaceReadStage(ctx context.Context, transport *gitserver.ReadTransport, s
 // mid-clone carries that record and stays replaceable without a human. A Git
 // checkout of anything else is someone else's, and its local commits are not
 // ox's to discard.
+//
+// It fails closed, which is what protects a stage from a budget that expires
+// mid-attempt: reading the origin needs a Git subprocess, a canceled context
+// cannot run one, and an unreadable origin refuses instead of deleting.
 func ownedReadStage(ctx context.Context, transport *gitserver.ReadTransport, stage string, opts ReadSyncOptions) bool {
 	if !Exists(stage) {
 		entries, err := os.ReadDir(stage)

@@ -16,6 +16,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sageox/ox/internal/gitserver"
+	"github.com/sageox/ox/internal/gitutil"
 	"github.com/sageox/ox/internal/lfs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -948,6 +950,37 @@ func TestReadSyncColdStageRefusesForeignDirectory(t *testing.T) {
 	require.NoDirExists(t, stage, "publishing consumes the stage")
 }
 
+// Failure prevented: a budget that expires mid-attempt is read as evidence
+// against the stage, so the objects it holds are deleted — the loss this whole
+// mechanism exists to prevent. Ownership is what protects it: reading the stage's
+// origin needs a Git subprocess, and a canceled context cannot run one, so the
+// stage is refused rather than replaced. The checkout lock selects randomly
+// between a free lock and a canceled context, so this drives the locked body
+// directly to keep the cancellation deterministic.
+func TestReadSyncColdStageSurvivesCanceledInspection(t *testing.T) {
+	c := newColdReadStageFixture(t)
+	stage := readStagePath(c.opts.Path)
+	require.Equal(t, "missing_hydration", ReadSync(context.Background(), c.opts).ErrorClass)
+	require.DirExists(t, stage)
+
+	transport, err := gitserver.NewReadTransport(c.opts.Endpoint, c.opts.RepoID, c.opts.ReadURL)
+	require.NoError(t, err)
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	var result ReadSyncResult
+	require.NoError(t, gitutil.WithRepoLock(context.Background(), c.opts.Path, func() error {
+		result = readSyncLocked(canceled, c.opts, transport)
+		return nil
+	}))
+	require.False(t, result.Ready)
+	require.Equal(t, "interrupted", result.ErrorClass)
+	require.NoDirExists(t, c.opts.Path)
+	kept, err := os.ReadFile(filepath.Join(stage, "sessions/cold/a.md"))
+	require.NoError(t, err)
+	require.Equal(t, c.contents[c.paths["sessions/cold/a.md"]], kept, "cancellation is not evidence against the stage")
+	require.Equal(t, int32(1), c.transferred("a"), "nothing was transferred again")
+}
+
 func tamperReadStageReceipt(t *testing.T, stage string, mutate func(*readReceipt)) {
 	t.Helper()
 	data, err := os.ReadFile(filepath.Join(stage, readReceiptRelative))
@@ -982,6 +1015,11 @@ func TestReadSyncColdStageResumesOnlyProvenIdentity(t *testing.T) {
 		}},
 		{name: "no receipt", damage: func(t *testing.T, stage string) {
 			require.NoError(t, os.Remove(filepath.Join(stage, readReceiptRelative)))
+		}},
+		{name: "symlinked receipt directory", damage: func(t *testing.T, stage string) {
+			dir := filepath.Join(stage, ".sageox/cache/read-sync")
+			require.NoError(t, os.RemoveAll(dir))
+			require.NoError(t, os.Symlink(t.TempDir(), dir))
 		}},
 		{name: "damaged worktree", damage: func(t *testing.T, stage string) {
 			require.NoError(t, os.WriteFile(filepath.Join(stage, "sessions/cold/a.md"), []byte("not the object\n"), 0600))
