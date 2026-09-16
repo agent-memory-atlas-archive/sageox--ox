@@ -657,15 +657,16 @@ func hydrateReadFiles(ctx context.Context, transport *gitserver.ReadTransport, d
 		oid := f.ref.BareOID()
 		if same := pending[oid]; len(same) != 0 {
 			if same[0].ref.Size != f.ref.Size {
-				// The object is requested at the first file's size, so this file
-				// cannot verify against the grant whichever pointer is wrong. It
-				// is dropped from pending; the files that agree still hydrate.
+				// At most one of the two pointers can be right, and which one is
+				// not knowable until the bytes arrive. Both files stay pending so
+				// that each one's own size verification decides whether it may
+				// commit: dropping either here would pick the winner by path
+				// order and strand the correct pointer when it sorts second.
 				err := missingHydration(ReadFailureDetail{Reason: "shared_object_size_conflict", Path: f.path,
 					OID: oid, ExpectedSize: readSize(same[0].ref.Size), ActualSize: readSize(f.ref.Size)})
 				if !skips.skip(ctx, err) {
 					return err
 				}
-				continue
 			}
 		} else {
 			requests = append(requests, lfs.BatchObject{OID: oid, Size: f.ref.Size})
@@ -729,7 +730,8 @@ func hydrateReadFiles(ctx context.Context, transport *gitserver.ReadTransport, d
 			requested[object.OID] = true
 			// pending is keyed by the OIDs this batch was built from, so a
 			// requested object always has at least one file waiting on it.
-			file := pending[object.OID][0]
+			waiting := pending[object.OID]
+			file := waiting[0]
 			switch {
 			case object.Error != nil:
 				// Refusal is checked before size. A refused object carries no
@@ -739,7 +741,11 @@ func hydrateReadFiles(ctx context.Context, transport *gitserver.ReadTransport, d
 				// under the same rule that classifies it as "denied".
 				err = &readFailure{err: &lfs.HTTPError{StatusCode: object.Error.Code},
 					detail: ReadFailureDetail{Reason: "object_refused", Path: file.path, OID: object.OID, ServerCode: object.Error.Code}}
-			case file.ref.Size != object.Size:
+			// The grant is accepted when any waiting file declares the granted
+			// size, not only the one whose size was requested. When two pointers
+			// disagree, a server that reports the object's own size is what says
+			// which of them to believe, and the download verifies it again.
+			case !slices.ContainsFunc(waiting, func(f readFile) bool { return f.ref.Size == object.Size }):
 				err = missingHydration(ReadFailureDetail{Reason: "object_size_mismatch", Path: file.path,
 					OID: object.OID, ExpectedSize: readSize(file.ref.Size), ActualSize: readSize(object.Size)})
 			case object.Actions == nil:

@@ -85,7 +85,7 @@ The sample paths and counts are illustrative; the returned coverage describes th
 | `coverage.paths` | Required materialized paths/patterns for the receipt. Sessions and plans are always retained. |
 | `coverage.files`, `coverage.empty` | Verified file count and whether the selected committed tree is empty. Empty is distinct from failed discovery or missing hydration. An unborn HEAD does not qualify and remains unavailable. |
 | `hydration.state` | `complete`, `missing`, or `unknown`. |
-| `hydration.required`, `hydration.completed` | Required current-worktree LFS objects and successfully verified objects. |
+| `hydration.required`, `hydration.completed` | Current-worktree files whose committed blob is an LFS pointer, and how many of those are materialized and verified. Files that name one shared object are counted separately. |
 | `error_class` | Sanitized failure category, omitted when none. |
 | `error_detail` | What failed, omitted when the failure carries no recognized reason. See [Failure detail](#failure-detail). |
 
@@ -147,7 +147,7 @@ An `oid` or `expected_oid` is omitted when the value supplied for it is not a ca
 
 Detail obeys the same redaction rules as the rest of the result: no credential, credential-bearing URL, response body, or subprocess output. Server-supplied and pointer-supplied identifiers are validated before they are carried, never sanitized in place. There is no server message field. The client replaces a read route's per-object error prose with the status text for that error's code before any caller sees it, so a message field could only restate `server_code` and would misrepresent a client-generated string as the server's own.
 
-Consumers must tolerate four things: additional reasons; a detail carrying `reason` alone, because a batch-level failure such as `batch_response_incomplete` identifies no single object; an absent `error_detail`, because a failure raised without a reason — a denied batch request, a Git failure, a canceled operation — carries none; and a detail that names one object when hydration skipped several, because it reports the first one skipped. `hydration.required` minus `hydration.completed` is how many objects are missing.
+Consumers must tolerate four things: additional reasons; a detail carrying `reason` alone, because a batch-level failure such as `batch_response_incomplete` identifies no single object; an absent `error_detail`, because a failure raised without a reason — a denied batch request, a Git failure, a canceled operation — carries none; and a detail that names one object when hydration skipped several, because it reports the first one skipped. `hydration.required` minus `hydration.completed` is how many pointer files are still stubs — both count files, not unique objects, so several files naming one unservable object each add to that difference.
 
 ## Remote evidence and local recovery
 

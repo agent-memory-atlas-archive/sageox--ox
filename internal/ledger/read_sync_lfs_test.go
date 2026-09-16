@@ -189,6 +189,9 @@ func TestReadSyncLFSBoundedBatchesPreserveProgress(t *testing.T) {
 	for _, tc := range []struct{ name, errorClass string }{
 		{name: "complete"},
 		{name: "later batch foreign", errorClass: "missing_hydration"},
+		// A batch the server cannot serve right now is the transient case: it
+		// must not stop hydration, only leave its own objects unmaterialized.
+		{name: "later batch unavailable", errorClass: "missing_hydration"},
 		{name: "later batch denied", errorClass: "denied"},
 		{name: "later batch canceled", errorClass: "interrupted"},
 	} {
@@ -237,6 +240,9 @@ func TestReadSyncLFSBoundedBatchesPreserveProgress(t *testing.T) {
 				}
 				if batch == 2 {
 					switch tc.name {
+					case "later batch unavailable":
+						w.WriteHeader(http.StatusInternalServerError)
+						return
 					case "later batch denied":
 						w.WriteHeader(http.StatusForbidden)
 						return
@@ -441,55 +447,75 @@ func TestSafeReadOIDAcceptsOnlyCanonicalIdentifiers(t *testing.T) {
 
 // Failure prevented: two files naming one object at different sizes are batched
 // under a single size, so at most one of them can ever verify — and the failure
-// does not say which pointer disagrees. Only the disagreeing file is dropped:
-// condemning the file the grant does match is the ox #947 defect.
-func TestReadSyncLFSSharedObjectSizeConflictNamesTheFile(t *testing.T) {
+// does not say which pointer disagrees. The file whose pointer the bytes match
+// hydrates whichever path order it happens to have: picking the winner by path
+// order strands the correct pointer whenever it sorts second, which is the ox
+// #947 defect one level down.
+func TestReadSyncLFSSharedObjectSizeConflictHydratesTheCorrectPointer(t *testing.T) {
 	content := []byte("one object claimed at two sizes\n")
 	oid := lfs.ComputeOID(content)
-	var batches, downloads atomic.Int32
-	f := newReadLFSFixture(t, func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasSuffix(r.URL.Path, "/batch") {
-			downloads.Add(1)
-			_, _ = w.Write(content)
-			return
-		}
-		batches.Add(1)
-		var request struct {
-			Objects []lfs.BatchObject `json:"objects"`
-		}
-		assert.NoError(t, json.NewDecoder(r.Body).Decode(&request))
-		assert.Equal(t, []lfs.BatchObject{{OID: oid, Size: int64(len(content))}}, request.Objects,
-			"the object is requested once, at the size the agreeing pointer declares")
-		response := lfs.BatchResponse{}
-		for _, object := range request.Objects {
-			response.Objects = append(response.Objects, lfs.BatchResponseObject{
-				OID: object.OID, Size: object.Size, Actions: &lfs.Actions{Download: &lfs.Action{
-					Href: "https://" + r.Host + strings.TrimSuffix(r.URL.Path, "/batch") + "/" + object.OID,
-				}},
+	// The truthful size is the content's; the other pointer is the wrong one
+	// whichever path it sits on. "a" sorts before "b" in the committed tree.
+	const first, second = "sessions/a/session.md", "sessions/b/session.md"
+	for _, tc := range []struct{ name, correct, wrong string }{
+		{"correct pointer sorts first", first, second},
+		{"correct pointer sorts second", second, first},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var batches, downloads atomic.Int32
+			f := newReadLFSFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				if !strings.HasSuffix(r.URL.Path, "/batch") {
+					downloads.Add(1)
+					_, _ = w.Write(content)
+					return
+				}
+				batches.Add(1)
+				var request struct {
+					Objects []lfs.BatchObject `json:"objects"`
+				}
+				assert.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+				assert.Len(t, request.Objects, 1, "one object, however many pointers name it")
+				assert.Equal(t, oid, request.Objects[0].OID)
+				response := lfs.BatchResponse{}
+				for _, object := range request.Objects {
+					// Echo the requested size, the least helpful thing a server may
+					// do here: the grant then carries no evidence of which pointer
+					// is right, so only the download can settle it.
+					response.Objects = append(response.Objects, lfs.BatchResponseObject{
+						OID: object.OID, Size: object.Size, Actions: &lfs.Actions{Download: &lfs.Action{
+							Href: "https://" + r.Host + strings.TrimSuffix(r.URL.Path, "/batch") + "/" + object.OID,
+						}},
+					})
+				}
+				assert.NoError(t, json.NewEncoder(w).Encode(response))
 			})
-		}
-		assert.NoError(t, json.NewEncoder(w).Encode(response))
-	})
-	require.True(t, ReadSync(context.Background(), f.opts).Ready)
-	const agreed, conflicting = "sessions/a/session.md", "sessions/b/session.md"
-	conflictingPointer := lfs.FormatPointer("sha256:"+oid, int64(len(content))+1)
-	commitReadPointer(t, f, agreed, lfs.FormatPointer("sha256:"+oid, int64(len(content))))
-	commitReadPointer(t, f, conflicting, conflictingPointer)
+			require.True(t, ReadSync(context.Background(), f.opts).Ready)
+			wrongPointer := lfs.FormatPointer("sha256:"+oid, int64(len(content))+1)
+			pointers := map[string]string{
+				tc.correct: lfs.FormatPointer("sha256:"+oid, int64(len(content))),
+				tc.wrong:   wrongPointer,
+			}
+			for _, path := range []string{first, second} {
+				commitReadPointer(t, f, path, pointers[path])
+			}
 
-	result := ReadSync(context.Background(), f.opts)
-	require.False(t, result.Ready)
-	require.Equal(t, "missing_hydration", result.ErrorClass)
-	require.Equal(t, &ReadFailureDetail{Reason: "shared_object_size_conflict", Path: conflicting,
-		OID: oid, ExpectedSize: readSize(int64(len(content))), ActualSize: readSize(int64(len(content)) + 1)}, result.ErrorDetail)
-	require.Equal(t, ReadHydration{State: "missing", Required: 2, Completed: 1}, result.Hydration)
-	require.Equal(t, int32(1), batches.Load())
-	require.Equal(t, int32(1), downloads.Load())
-	hydrated, err := os.ReadFile(filepath.Join(f.opts.Path, agreed))
-	require.NoError(t, err)
-	require.Equal(t, content, hydrated, "the file the grant matches still hydrates")
-	stub, err := os.ReadFile(filepath.Join(f.opts.Path, conflicting))
-	require.NoError(t, err)
-	require.Equal(t, conflictingPointer, string(stub), "the disagreeing pointer keeps its stub")
+			result := ReadSync(context.Background(), f.opts)
+			require.False(t, result.Ready)
+			require.Equal(t, "missing_hydration", result.ErrorClass)
+			require.Equal(t, "shared_object_size_conflict", result.ErrorDetail.Reason)
+			require.Equal(t, oid, result.ErrorDetail.OID)
+			require.Equal(t, second, result.ErrorDetail.Path, "the detail names the pointer that disagreed with the first")
+			require.Equal(t, ReadHydration{State: "missing", Required: 2, Completed: 1}, result.Hydration)
+			require.Equal(t, int32(1), batches.Load())
+
+			hydrated, err := os.ReadFile(filepath.Join(f.opts.Path, tc.correct))
+			require.NoError(t, err)
+			require.Equal(t, content, hydrated, "the pointer the bytes match hydrates regardless of path order")
+			stub, err := os.ReadFile(filepath.Join(f.opts.Path, tc.wrong))
+			require.NoError(t, err)
+			require.Equal(t, wrongPointer, string(stub), "the pointer the bytes contradict keeps its stub")
+		})
+	}
 }
 
 // Failure prevented: a refused object reports only "missing_hydration", so
