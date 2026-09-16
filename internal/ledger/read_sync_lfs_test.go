@@ -717,6 +717,11 @@ func TestReadSkipsStopOnlyWhereContinuingCannotMaterialize(t *testing.T) {
 		{"object unauthorized", context.Background(), refused(http.StatusUnauthorized), true},
 		{"credential unusable", context.Background(), fmt.Errorf("download: %w", auth.ErrReadTokenUnavailable), true},
 		{"canceled", canceled, refused(http.StatusNotFound), true},
+		// lfs.Client carries its own request deadline, so a timed-out request
+		// reports a deadline while the caller's context is still live. Walking
+		// past it spends that deadline again on every batch that remains.
+		{"client deadline", context.Background(), fmt.Errorf("batch request: %w", context.DeadlineExceeded), true},
+		{"client canceled", context.Background(), fmt.Errorf("batch request: %w", context.Canceled), true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var skips readSkips

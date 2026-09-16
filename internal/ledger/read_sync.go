@@ -303,8 +303,17 @@ func safeReadOID(oid string) string {
 	return oid
 }
 
+// readInterrupted reports whether the operation itself stopped, rather than one
+// object failing. The caller's context is not the only evidence: lfs.Client
+// carries its own request deadline, and a request that exceeds it fails with an
+// error wrapping context.DeadlineExceeded while ctx is still live. Hydration and
+// classification must read that the same way, so both ask here.
+func readInterrupted(ctx context.Context, err error) bool {
+	return ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
 func readErrorClass(ctx context.Context, err error) string {
-	if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	if readInterrupted(ctx, err) {
 		return "interrupted"
 	}
 	if errors.Is(err, gitserver.ErrReadTokenUnavailable) || errors.Is(err, auth.ErrReadTokenUnavailable) {
@@ -596,15 +605,15 @@ type readSkips struct{ first error }
 
 // skip records err and reports whether hydration may continue past it.
 //
-// A canceled context, an unusable read credential, and a 401/403 are about the
-// operation or the grant rather than one object: no later object could be
-// materialized either, so they stop hydration where they happen. Everything
-// else is about a single object, and stopping there would leave every later
-// object a stub for as long as the condition lasts.
+// An interrupted operation, an unusable read credential, and a 401/403 are
+// about the operation or the grant rather than one object: no later object
+// could be materialized either, so they stop hydration where they happen.
+// Everything else is about a single object, and stopping there would leave
+// every later object a stub for as long as the condition lasts.
 func (s *readSkips) skip(ctx context.Context, err error) bool {
 	var httpErr *lfs.HTTPError
 	switch {
-	case ctx.Err() != nil,
+	case readInterrupted(ctx, err),
 		errors.Is(err, auth.ErrReadTokenUnavailable),
 		errors.As(err, &httpErr) && (httpErr.StatusCode == 401 || httpErr.StatusCode == 403):
 		return false
