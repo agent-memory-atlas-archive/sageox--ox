@@ -745,6 +745,30 @@ func TestReadSyncColdHydrationFailureResumesTransferredObjects(t *testing.T) {
 	require.Equal(t, int32(3), c.transferred("c"))
 }
 
+// Failure prevented: the stage path is derived from the checkout name, so a
+// directory ox never created can already sit there. Deleting it because the
+// name matched would destroy content this command does not own.
+func TestReadSyncColdStageRefusesForeignDirectory(t *testing.T) {
+	f := newReadFixture(t)
+	stage := readStagePath(f.opts.Path)
+	require.NoError(t, os.MkdirAll(filepath.Join(stage, "notes"), 0700))
+	require.NoError(t, os.WriteFile(filepath.Join(stage, "notes/keep.txt"), []byte("not ox's\n"), 0600))
+
+	result := ReadSync(context.Background(), f.opts)
+	require.False(t, result.Ready)
+	require.Equal(t, "dirty", result.ErrorClass)
+	require.NoDirExists(t, f.opts.Path, "a refusal publishes nothing")
+	kept, err := os.ReadFile(filepath.Join(stage, "notes/keep.txt"))
+	require.NoError(t, err)
+	require.Equal(t, "not ox's\n", string(kept))
+
+	// An empty directory holds nothing to lose, so a cold clone claims it.
+	require.NoError(t, os.RemoveAll(stage))
+	require.NoError(t, os.MkdirAll(stage, 0700))
+	require.True(t, ReadSync(context.Background(), f.opts).Ready)
+	require.NoDirExists(t, stage, "publishing consumes the stage")
+}
+
 func tamperReadStageReceipt(t *testing.T, stage string, mutate func(*readReceipt)) {
 	t.Helper()
 	data, err := os.ReadFile(filepath.Join(stage, readReceiptRelative))

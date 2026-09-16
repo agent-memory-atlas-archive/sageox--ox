@@ -121,12 +121,8 @@ func readSyncLocked(ctx context.Context, opts ReadSyncOptions, transport *gitser
 				result.ErrorClass = "interrupted"
 				return result
 			}
-			if err := os.RemoveAll(workPath); err != nil {
-				result.ErrorClass = "interrupted"
-				return result
-			}
-			if err := os.MkdirAll(workPath, 0700); err != nil {
-				result.ErrorClass = "interrupted"
+			if err := replaceReadStage(workPath); err != nil {
+				result.ErrorClass = readErrorClass(ctx, err)
 				return result
 			}
 		}
@@ -247,6 +243,31 @@ func readSyncLocked(ctx context.Context, opts ReadSyncOptions, transport *gitser
 // instead of restarting from an empty directory.
 func readStagePath(path string) string {
 	return filepath.Join(filepath.Dir(path), ".ox-read-clone-"+filepath.Base(path))
+}
+
+// replaceReadStage empties the staging path so a fresh clone can use it. The
+// path is derived from the checkout name, so something this command never
+// created can already be sitting there. Every state ox does leave at that path
+// is an empty directory or a Git checkout — `git clone` creates .git before it
+// writes anything else — so anything else is refused rather than deleted: the
+// name is not proof that ox produced what is there.
+func replaceReadStage(stage string) error {
+	if _, err := os.Lstat(stage); err == nil {
+		if !safeReadDirectory(stage) || (!Exists(stage) && !emptyReadDir(stage)) {
+			return errors.New("dirty")
+		}
+		if err := os.RemoveAll(stage); err != nil {
+			return errors.New("interrupted")
+		}
+	} else if !os.IsNotExist(err) {
+		return errors.New("interrupted")
+	}
+	return os.MkdirAll(stage, 0700)
+}
+
+func emptyReadDir(dir string) bool {
+	entries, err := os.ReadDir(dir)
+	return err == nil && len(entries) == 0
 }
 
 // resumableReadStage reports whether an earlier interrupted cold clone left a
