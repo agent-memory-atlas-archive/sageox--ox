@@ -671,7 +671,13 @@ func hydrateReadFiles(ctx context.Context, transport *gitserver.ReadTransport, d
 				// that each one's own size verification decides whether it may
 				// commit: dropping either here would pick the winner by path
 				// order and strand the correct pointer when it sorts second.
-				err := missingHydration(ReadFailureDetail{Reason: "shared_object_size_conflict", Path: f.path,
+				//
+				// The conflict is a property of the pair, so it names no path.
+				// Naming one would have to choose before the bytes settle it, and
+				// the file it chose would be the hydrated one half the time — an
+				// operator sent to a file that is fine. The losing file names
+				// itself later through downloaded_size_mismatch.
+				err := missingHydration(ReadFailureDetail{Reason: "shared_object_size_conflict",
 					OID: oid, ExpectedSize: readSize(same[0].ref.Size), ActualSize: readSize(f.ref.Size)})
 				if !skips.skip(ctx, err) {
 					return err

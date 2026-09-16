@@ -504,7 +504,12 @@ func TestReadSyncLFSSharedObjectSizeConflictHydratesTheCorrectPointer(t *testing
 			require.Equal(t, "missing_hydration", result.ErrorClass)
 			require.Equal(t, "shared_object_size_conflict", result.ErrorDetail.Reason)
 			require.Equal(t, oid, result.ErrorDetail.OID)
-			require.Equal(t, second, result.ErrorDetail.Path, "the detail names the pointer that disagreed with the first")
+			// Naming a file here would have to choose before the bytes settle
+			// which pointer is wrong, and would name the hydrated file in one of
+			// these two orderings — sending an operator to a file that is fine.
+			require.Empty(t, result.ErrorDetail.Path, "a conflict between two pointers names neither")
+			require.NotNil(t, result.ErrorDetail.ExpectedSize)
+			require.NotNil(t, result.ErrorDetail.ActualSize)
 			require.Equal(t, ReadHydration{State: "missing", Required: 2, Completed: 1}, result.Hydration)
 			require.Equal(t, int32(1), batches.Load())
 
