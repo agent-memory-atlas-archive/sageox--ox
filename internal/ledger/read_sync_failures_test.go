@@ -233,28 +233,31 @@ func TestReadSyncObjectMaterializationFailuresLeaveDestinationUntouched(t *testi
 		prep func(*testing.T, string, *lfs.FileRef) string
 	}{
 		{"missing parent", func(t *testing.T, root string, ref *lfs.FileRef) string {
-			return filepath.Join(root, "missing", "object")
+			return "missing/object"
 		}},
 		{"destination is directory", func(t *testing.T, root string, ref *lfs.FileRef) string {
-			path := filepath.Join(root, "object")
-			require.NoError(t, os.Mkdir(path, 0700))
-			return path
+			require.NoError(t, os.Mkdir(filepath.Join(root, "object"), 0700))
+			return "object"
 		}},
 		{"size mismatch", func(t *testing.T, root string, ref *lfs.FileRef) string {
 			ref.Size++
-			path := filepath.Join(root, "object")
-			require.NoError(t, os.WriteFile(path, []byte("original"), 0600))
-			return path
+			require.NoError(t, os.WriteFile(filepath.Join(root, "object"), []byte("original"), 0600))
+			return "object"
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			root := t.TempDir()
 			localRef := ref
-			path := tc.prep(t, root, &localRef)
-			err := materializeReadObject(context.Background(), action, path, localRef)
+			rel := tc.prep(t, root, &localRef)
+			path := filepath.Join(root, rel)
+			err := materializeReadObject(context.Background(), action, root, rel, localRef)
 			require.Error(t, err)
 			if tc.name == "size mismatch" {
 				require.EqualError(t, err, "missing_hydration")
+				var failure *readFailure
+				require.ErrorAs(t, err, &failure)
+				require.Equal(t, ReadFailureDetail{Reason: "downloaded_size_mismatch", Path: rel,
+					OID: localRef.BareOID(), ExpectedSize: readSize(localRef.Size), ActualSize: readSize(int64(len(content)))}, failure.detail)
 				actual, err := os.ReadFile(path)
 				require.NoError(t, err)
 				require.Equal(t, "original", string(actual))
@@ -457,18 +460,24 @@ func TestReadSyncCanceledHydrationCanRetry(t *testing.T) {
 // Failure prevented: HTTP authorization failures are treated as ordinary Git
 // failures, partial LFS objects are exposed, or a transient denial prevents retry.
 func TestReadSyncLFSHTTPFailuresPreserveStubAndRetry(t *testing.T) {
+	const path = "sessions/failure/session.md"
+	content := []byte("session body available after a transient failure")
+	oid := lfs.ComputeOID(content)
+	refused := func(code int) *ReadFailureDetail {
+		return &ReadFailureDetail{Reason: "download_refused", Path: path, OID: oid, ServerCode: code}
+	}
 	for _, tc := range []struct {
 		name, errorClass string
 		batch            bool
 		status           int
+		detail           *ReadFailureDetail
 	}{
-		{"batch denied", "denied", true, http.StatusUnauthorized},
-		{"download denied", "denied", false, http.StatusForbidden},
-		{"download missing", "missing_hydration", false, http.StatusNotFound},
+		// A denied batch names no object: the whole grant request was refused.
+		{"batch denied", "denied", true, http.StatusUnauthorized, nil},
+		{"download denied", "denied", false, http.StatusForbidden, refused(http.StatusForbidden)},
+		{"download missing", "missing_hydration", false, http.StatusNotFound, refused(http.StatusNotFound)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			content := []byte("session body available after a transient failure")
-			oid := lfs.ComputeOID(content)
 			var fail atomic.Bool
 			fail.Store(true)
 			f := newReadLFSFixture(t, func(w http.ResponseWriter, r *http.Request) {
@@ -489,11 +498,11 @@ func TestReadSyncLFSHTTPFailuresPreserveStubAndRetry(t *testing.T) {
 			})
 			ctx := context.Background()
 			require.True(t, ReadSync(ctx, f.opts).Ready)
-			path := "sessions/failure/session.md"
 			pointer := commitReadLFSPointer(t, f, path, content)
 			failed := ReadSync(ctx, f.opts)
 			require.False(t, failed.Ready)
 			require.Equal(t, tc.errorClass, failed.ErrorClass)
+			require.Equal(t, tc.detail, failed.ErrorDetail)
 			require.Nil(t, failed.LastSuccessfulSync)
 			actual, err := os.ReadFile(filepath.Join(f.opts.Path, path))
 			require.NoError(t, err)

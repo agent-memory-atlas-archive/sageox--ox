@@ -57,6 +57,30 @@ type ReadSyncResult struct {
 	Coverage           ReadCoverage  `json:"coverage"`
 	Hydration          ReadHydration `json:"hydration"`
 	ErrorClass         string        `json:"error_class,omitempty"`
+	// ErrorDetail says what failed, naming the object when one is identifiable.
+	// Additive within schema_version 1; consumers keep matching on ErrorClass.
+	ErrorDetail *ReadFailureDetail `json:"error_detail,omitempty"`
+}
+
+// ReadFailureDetail says what failed, naming the object when one is
+// identifiable, so an operator can act on it instead of correlating server
+// request logs against object storage by hand. Reason tells apart conditions
+// that deliberately share one error_class and is always set; every other field
+// applies only to some reasons. A batch-level failure carries Reason alone.
+//
+// Every field is locally computed or a server-supplied status code. No
+// credential, signed URL, response body, or subprocess output is carried here.
+// There is no server message field: lfs.Client replaces a read route's
+// per-object error prose with the status text for its code before it reaches
+// this package, so such a field could only restate ServerCode.
+type ReadFailureDetail struct {
+	Reason       string `json:"reason"`
+	Path         string `json:"path,omitempty"`
+	OID          string `json:"oid,omitempty"`
+	ExpectedOID  string `json:"expected_oid,omitempty"`
+	ExpectedSize *int64 `json:"expected_size,omitempty"`
+	ActualSize   *int64 `json:"actual_size,omitempty"`
+	ServerCode   int    `json:"server_code,omitempty"`
 }
 
 type readReceipt struct {
@@ -122,7 +146,7 @@ func readSyncLocked(ctx context.Context, opts ReadSyncOptions, transport *gitser
 				return result
 			}
 			if err := replaceReadStage(ctx, transport, workPath, opts); err != nil {
-				result.ErrorClass = readErrorClass(ctx, err)
+				recordReadFailure(ctx, &result, err)
 				return result
 			}
 		}
@@ -130,7 +154,7 @@ func readSyncLocked(ctx context.Context, opts ReadSyncOptions, transport *gitser
 		// Inspect all local content before fetch or dehydration. Verified hydration
 		// is an expected Git diff; any other local edit is preserved and refused.
 		if _, err := readFiles(ctx, transport, workPath, dirs, false); err != nil {
-			result.ErrorClass = readErrorClass(ctx, err)
+			recordReadFailure(ctx, &result, err)
 			return result
 		}
 	}
@@ -202,7 +226,7 @@ func readSyncLocked(ctx context.Context, opts ReadSyncOptions, transport *gitser
 	if staged && syncErr != nil {
 		// Keep the stage: it holds every object this attempt transferred, and it
 		// stays unpublished until resumableReadStage re-proves it.
-		result.ErrorClass = readErrorClass(ctx, syncErr)
+		recordReadFailure(ctx, &result, syncErr)
 		return result
 	}
 
@@ -216,13 +240,15 @@ func readSyncLocked(ctx context.Context, opts ReadSyncOptions, transport *gitser
 		result.LastSuccessfulSync = &observed
 	}
 	if syncErr != nil {
-		result.ErrorClass = readErrorClass(ctx, syncErr)
+		recordReadFailure(ctx, &result, syncErr)
 	}
 	if staged && !result.Ready {
 		return result
 	}
 	if err := publishReadReceipt(workPath, readReceipt{ReadSyncResult: result, ReadURL: opts.ReadURL}, nil); err != nil {
-		result.Ready, result.ErrorClass = false, "interrupted"
+		// Verification above may have recorded a detail. The failure now being
+		// reported is this write, not that object, so the detail goes with it.
+		result.Ready, result.ErrorClass, result.ErrorDetail = false, "interrupted", nil
 		return result
 	}
 	if staged {
@@ -299,6 +325,65 @@ func resumableReadStage(ctx context.Context, transport *gitserver.ReadTransport,
 
 func validReadTime(t *time.Time) bool {
 	return t != nil && !t.IsZero() && !t.After(time.Now().UTC())
+}
+
+// readFailure carries object detail on the error that decides error_class, so
+// naming the object can never change the failure's category.
+type readFailure struct {
+	detail ReadFailureDetail
+	err    error
+}
+
+func (e *readFailure) Error() string { return e.err.Error() }
+func (e *readFailure) Unwrap() error { return e.err }
+
+// missingHydration reports an object that cannot be materialized. The class
+// stays "missing_hydration"; detail.Reason is what tells the conditions apart.
+func missingHydration(detail ReadFailureDetail) error {
+	return &readFailure{detail: detail, err: errors.New("missing_hydration")}
+}
+
+// readSize boxes a size for ReadFailureDetail. A pointer is what keeps a
+// legitimately zero observed size distinguishable from an unset field.
+func readSize(n int64) *int64 { return &n }
+
+// recordReadFailure sets the sanitized category together with the object detail
+// err carries. Both move together so a result can never pair one failure's
+// class with another failure's object. It is the only place that populates
+// ErrorDetail, which is what makes the OID sanitation below unskippable.
+func recordReadFailure(ctx context.Context, result *ReadSyncResult, err error) {
+	result.ErrorClass = readErrorClass(ctx, err)
+	result.ErrorDetail = nil
+	// A canceled or expired context classifies as "interrupted" whatever err
+	// says, including an object failure raised just before the deadline landed
+	// — verification runs Git subprocesses between the two. The operation, not
+	// that object, is what failed, so the detail goes with it.
+	if result.ErrorClass == "interrupted" {
+		return
+	}
+	var failure *readFailure
+	if errors.As(err, &failure) {
+		detail := failure.detail
+		detail.OID, detail.ExpectedOID = safeReadOID(detail.OID), safeReadOID(detail.ExpectedOID)
+		result.ErrorDetail = &detail
+	}
+}
+
+// safeReadOID returns oid only when it is a canonical bare SHA-256 identifier.
+// An unrequested object in a batch response, and an "oid" line in a committed
+// pointer, are both arbitrary text that no code validates before it reaches a
+// detail. Dropping a non-canonical value keeps the result's redaction rule —
+// no credential, credential-bearing URL, or raw server bytes — unconditional.
+func safeReadOID(oid string) string {
+	if len(oid) != 64 {
+		return ""
+	}
+	for i := range len(oid) {
+		if c := oid[i]; (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return ""
+		}
+	}
+	return oid
 }
 
 func readErrorClass(ctx context.Context, err error) string {
@@ -439,12 +524,15 @@ func readFiles(ctx context.Context, transport *gitserver.ReadTransport, dir stri
 			if oid, pointerSize, err := lfs.ParsePointer(string(pointer)); err == nil {
 				file.pointer, file.ref = pointer, lfs.FileRef{OID: oid, Size: pointerSize}
 			} else if strings.HasPrefix(string(pointer), "version https://git-lfs.github.com/spec/v1\n") {
-				return nil, errors.New("missing_hydration")
+				return nil, missingHydration(ReadFailureDetail{Reason: "malformed_pointer", Path: name})
 			}
 		}
 		if gitOID != file.oid {
 			if len(file.pointer) != 0 {
-				return nil, errors.New("missing_hydration") // nested stub is not reader content
+				// The worktree file is itself a pointer, and not the one HEAD
+				// commits. It names some other object, so it is not this file's
+				// content and no OID here would be the one worth reporting.
+				return nil, missingHydration(ReadFailureDetail{Reason: "nested_stub", Path: name})
 			}
 			blobSize, err := runReadGit(ctx, transport, false, dir, "cat-file", "-s", file.oid)
 			if err != nil {
@@ -601,7 +689,8 @@ func hydrateReadFiles(ctx context.Context, transport *gitserver.ReadTransport, d
 			// may never have stored it, so never spend a grant on it: verify the OID is
 			// the empty-content hash and materialize the empty file locally.
 			if f.ref.BareOID() != lfs.ComputeOID(nil) {
-				return errors.New("missing_hydration")
+				return missingHydration(ReadFailureDetail{Reason: "empty_object_oid_mismatch",
+					Path: f.path, OID: f.ref.BareOID(), ExpectedOID: lfs.ComputeOID(nil)})
 			}
 			if err := materializeEmptyReadObject(filepath.Join(dir, f.path)); err != nil {
 				return err
@@ -611,7 +700,8 @@ func hydrateReadFiles(ctx context.Context, transport *gitserver.ReadTransport, d
 		oid := f.ref.BareOID()
 		if same := pending[oid]; len(same) != 0 {
 			if same[0].ref.Size != f.ref.Size {
-				return errors.New("missing_hydration")
+				return missingHydration(ReadFailureDetail{Reason: "shared_object_size_conflict", Path: f.path,
+					OID: oid, ExpectedSize: readSize(same[0].ref.Size), ActualSize: readSize(f.ref.Size)})
 			}
 		} else {
 			requests = append(requests, lfs.BatchObject{OID: oid, Size: f.ref.Size})
@@ -636,7 +726,9 @@ func hydrateReadFiles(ctx context.Context, transport *gitserver.ReadTransport, d
 			return err
 		}
 		if len(resp.Objects) != len(batch) {
-			return errors.New("missing_hydration")
+			// The count itself is the defect. No OID is identifiable as the one
+			// at fault, so this failure names the batch rather than an object.
+			return missingHydration(ReadFailureDetail{Reason: "batch_response_incomplete"})
 		}
 		actions := make(map[string]*lfs.Action, len(batch))
 		for _, object := range batch {
@@ -644,20 +736,39 @@ func hydrateReadFiles(ctx context.Context, transport *gitserver.ReadTransport, d
 		}
 		for _, object := range resp.Objects {
 			action, requested := actions[object.OID]
-			if !requested || action != nil {
-				return errors.New("missing_hydration")
+			if !requested {
+				return missingHydration(ReadFailureDetail{Reason: "batch_object_unrequested", OID: object.OID})
 			}
-			if object.Error != nil && (object.Error.Code == 401 || object.Error.Code == 403) {
-				return &lfs.HTTPError{StatusCode: object.Error.Code}
+			if action != nil {
+				return missingHydration(ReadFailureDetail{Reason: "batch_object_duplicated", OID: object.OID})
 			}
-			if pending[object.OID][0].ref.Size != object.Size || object.Error != nil || object.Actions == nil || object.Actions.Download == nil {
-				return errors.New("missing_hydration")
+			// pending is keyed by the OIDs this batch was built from, so a
+			// requested object always has at least one file waiting on it.
+			file := pending[object.OID][0]
+			if object.Error != nil {
+				// Refusal is checked before size. A refused object carries no
+				// meaningful size, so checking size first reports a size mismatch
+				// for what is really a refusal.
+				detail := ReadFailureDetail{Reason: "object_refused", Path: file.path, OID: object.OID, ServerCode: object.Error.Code}
+				if object.Error.Code == 401 || object.Error.Code == 403 {
+					return &readFailure{detail: detail, err: &lfs.HTTPError{StatusCode: object.Error.Code}}
+				}
+				return missingHydration(detail)
+			}
+			switch {
+			case file.ref.Size != object.Size:
+				return missingHydration(ReadFailureDetail{Reason: "object_size_mismatch", Path: file.path,
+					OID: object.OID, ExpectedSize: readSize(file.ref.Size), ActualSize: readSize(object.Size)})
+			case object.Actions == nil:
+				return missingHydration(ReadFailureDetail{Reason: "object_missing_actions", Path: file.path, OID: object.OID})
+			case object.Actions.Download == nil:
+				return missingHydration(ReadFailureDetail{Reason: "object_missing_download_action", Path: file.path, OID: object.OID})
 			}
 			actions[object.OID] = object.Actions.Download
 		}
 		for _, object := range batch {
 			for _, f := range pending[object.OID] {
-				if err := materializeReadObject(ctx, actions[object.OID], filepath.Join(dir, f.path), f.ref); err != nil {
+				if err := materializeReadObject(ctx, actions[object.OID], dir, f.path, f.ref); err != nil {
 					return err
 				}
 			}
@@ -666,7 +777,10 @@ func hydrateReadFiles(ctx context.Context, transport *gitserver.ReadTransport, d
 	return nil
 }
 
-func materializeReadObject(ctx context.Context, action *lfs.Action, path string, ref lfs.FileRef) error {
+// materializeReadObject downloads one object into rel under dir. rel is the
+// repo-relative path a failure names; dir never appears in the detail.
+func materializeReadObject(ctx context.Context, action *lfs.Action, dir, rel string, ref lfs.FileRef) error {
+	path := filepath.Join(dir, rel)
 	f, err := os.CreateTemp(filepath.Dir(path), ".ox-read-object-*")
 	if err != nil {
 		return err
@@ -674,15 +788,28 @@ func materializeReadObject(ctx context.Context, action *lfs.Action, path string,
 	defer os.Remove(f.Name())
 	defer f.Close()
 	if err := lfs.DownloadToFileContext(ctx, action, f, true, ref.BareOID()); err != nil {
-		var httpErr *lfs.HTTPError
-		if errors.As(err, &httpErr) || errors.Is(err, auth.ErrReadTokenUnavailable) || ctx.Err() != nil {
+		// Cancellation and a missing credential are about the operation, not this
+		// object, and readErrorClass reports them ahead of any status. Returning
+		// them undecorated keeps the class and the detail describing one failure.
+		if errors.Is(err, auth.ErrReadTokenUnavailable) || ctx.Err() != nil {
 			return err
 		}
-		return errors.New("missing_hydration")
+		var httpErr *lfs.HTTPError
+		if errors.As(err, &httpErr) {
+			// Wrapping keeps readErrorClass's own HTTPError handling: 401/403
+			// stays "denied", every other status stays "missing_hydration".
+			return &readFailure{err: err, detail: ReadFailureDetail{Reason: "download_refused",
+				Path: rel, OID: ref.BareOID(), ServerCode: httpErr.StatusCode}}
+		}
+		return missingHydration(ReadFailureDetail{Reason: "download_failed", Path: rel, OID: ref.BareOID()})
 	}
 	info, err := f.Stat()
-	if err != nil || info.Size() != ref.Size {
-		return errors.New("missing_hydration")
+	if err != nil {
+		return missingHydration(ReadFailureDetail{Reason: "download_stat_failed", Path: rel, OID: ref.BareOID()})
+	}
+	if info.Size() != ref.Size {
+		return missingHydration(ReadFailureDetail{Reason: "downloaded_size_mismatch", Path: rel, OID: ref.BareOID(),
+			ExpectedSize: readSize(ref.Size), ActualSize: readSize(info.Size())})
 	}
 	return commitReadObject(f, path)
 }
@@ -735,7 +862,7 @@ func verifyReadCheckout(ctx context.Context, opts ReadSyncOptions, transport *gi
 	}
 	files, err := readFiles(ctx, transport, dir, dirs, true)
 	if err != nil {
-		result.ErrorClass = readErrorClass(ctx, err)
+		recordReadFailure(ctx, &result, err)
 		return result
 	}
 	result.Coverage = ReadCoverage{Complete: true, Paths: dirs, Files: len(files), Empty: len(files) == 0}
@@ -749,21 +876,42 @@ func verifyReadCheckout(ctx context.Context, opts ReadSyncOptions, transport *gi
 		}
 	}
 	if result.Hydration.Required != result.Hydration.Completed {
-		result.Hydration.State, result.ErrorClass = "missing", "missing_hydration"
+		result.Hydration.State = "missing"
+		// Routed through recordReadFailure so this detail is sanitized on the
+		// same path as every other one.
+		missing := errors.New("missing_hydration")
+		for _, f := range files {
+			if len(f.pointer) != 0 && !f.hydrated {
+				missing = missingHydration(ReadFailureDetail{Reason: "object_not_materialized", Path: f.path, OID: f.ref.BareOID()})
+				break
+			}
+		}
+		recordReadFailure(ctx, &result, missing)
 		return result
 	}
 	result.Ready = true
 	return result
 }
 
+// ReadNotReadyError reports that the guard refused a read because the local
+// checkout did not verify. Class is one of the sanitized categories published in
+// docs/specs/ledger-read-sync.md, so a CLI reader can surface it without
+// pattern-matching an error string.
+type ReadNotReadyError struct{ Class string }
+
+func (e *ReadNotReadyError) Error() string { return e.Class }
+
 // WithReadCheckout holds the SAME lock as materialization for the entire read.
 // The callback must finish all filesystem reads before returning. It must not
 // call another locking ledger function. Authorization belongs to the caller.
+//
+// A refused read returns *ReadNotReadyError. Any other error means the lock
+// itself could not be taken.
 func WithReadCheckout(ctx context.Context, path, repoID, endpoint string, read func(ReadSyncResult) error) error {
 	return gitutil.WithRepoLock(ctx, path, func() error {
 		result := checkReadinessLocked(ctx, path, repoID, endpoint)
 		if !result.Ready {
-			return errors.New(result.ErrorClass)
+			return &ReadNotReadyError{Class: result.ErrorClass}
 		}
 		return read(result)
 	})
@@ -802,7 +950,8 @@ func checkReadinessLocked(ctx context.Context, path, repoID, endpoint string) Re
 		result.LastSuccessfulSync = previous.LastSuccessfulSync
 	}
 	if err := publishReadReceipt(path, readReceipt{ReadSyncResult: result, ReadURL: opts.ReadURL}, nil); err != nil {
-		result.Ready, result.ErrorClass = false, "interrupted"
+		// Same as the refresh path: a verification detail cannot outlive it.
+		result.Ready, result.ErrorClass, result.ErrorDetail = false, "interrupted", nil
 	}
 	return result
 }
