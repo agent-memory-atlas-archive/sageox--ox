@@ -788,7 +788,11 @@ func hydrateReadFiles(ctx context.Context, transport *gitserver.ReadTransport, d
 			}
 			continue
 		}
-		if len(resp.Objects) != len(batch) {
+		// Only a short response is a counting defect. A surplus one is always a
+		// specific entry — unrequested or repeated — and the loop below names it;
+		// recording the count here first would mask that with a vaguer reason,
+		// since the first failure walked past is the one reported.
+		if len(resp.Objects) < len(batch) {
 			// The count itself is the defect. No OID is identifiable as the one
 			// at fault, so this failure names the batch rather than an object.
 			// The objects the response does describe are still materialized; the

@@ -409,6 +409,68 @@ func TestReadSyncLFSBatchRejectsInvalidResponseObjectsIndividually(t *testing.T)
 	}
 }
 
+// Failure prevented: a response holding MORE objects than the batch reports
+// batch_response_incomplete — a reason the contract defines as "fewer objects
+// than the batch" — and, being recorded before the per-object loop runs, that
+// vaguer reason is the one retained, hiding which entry was actually surplus.
+func TestReadSyncLFSSurplusBatchResponseNamesTheSurplusEntry(t *testing.T) {
+	firstPath, secondPath := "sessions/a/session.md", "sessions/b/session.md"
+	firstOID := lfs.ComputeOID([]byte(firstPath + "\n"))
+	contents := map[string][]byte{
+		firstOID: []byte(firstPath + "\n"), lfs.ComputeOID([]byte(secondPath + "\n")): []byte(secondPath + "\n"),
+	}
+	var batches, downloads atomic.Int32
+	f := newReadLFSFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/batch") {
+			downloads.Add(1)
+			content, ok := contents[filepath.Base(r.URL.Path)]
+			if !assert.True(t, ok) {
+				http.NotFound(w, r)
+				return
+			}
+			_, _ = w.Write(content)
+			return
+		}
+		batches.Add(1)
+		var request struct {
+			Objects []lfs.BatchObject `json:"objects"`
+		}
+		assert.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+		if !assert.Len(t, request.Objects, 2) {
+			http.Error(w, "expected a single combined batch", http.StatusBadRequest)
+			return
+		}
+		objects := make([]lfs.BatchResponseObject, 0, 3)
+		for _, object := range request.Objects {
+			objects = append(objects, lfs.BatchResponseObject{
+				OID: object.OID, Size: object.Size, Actions: &lfs.Actions{Download: &lfs.Action{
+					Href: "https://" + r.Host + strings.TrimSuffix(r.URL.Path, "/batch") + "/" + object.OID,
+				}},
+			})
+		}
+		// One entry too many: the first object repeated.
+		objects = append(objects, objects[0])
+		assert.NoError(t, json.NewEncoder(w).Encode(lfs.BatchResponse{Objects: objects}))
+	})
+	require.True(t, ReadSync(context.Background(), f.opts).Ready)
+	for _, path := range []string{firstPath, secondPath} {
+		commitReadLFSPointer(t, f, path, []byte(path+"\n"))
+	}
+
+	result := ReadSync(context.Background(), f.opts)
+	require.Equal(t, "missing_hydration", result.ErrorClass)
+	require.Equal(t, &ReadFailureDetail{Reason: "batch_object_duplicated", OID: firstOID}, result.ErrorDetail,
+		"a surplus entry is named, not counted")
+	require.Equal(t, int32(1), batches.Load())
+	// Both requested objects were described correctly, so both still materialize.
+	require.Equal(t, int32(2), downloads.Load())
+	for _, path := range []string{firstPath, secondPath} {
+		actual, err := os.ReadFile(filepath.Join(f.opts.Path, path))
+		require.NoError(t, err)
+		require.Equal(t, path+"\n", string(actual), path)
+	}
+}
+
 // Failure prevented: a deadline that lands after an object failure was raised
 // reports "interrupted" while still naming the object, so error_class and
 // error_detail describe two different failures. Verification runs Git
