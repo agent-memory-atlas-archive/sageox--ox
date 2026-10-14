@@ -235,11 +235,16 @@ func buildSessionRecordingEntry(s *session.RecordingState, alive *bool, status s
 // so the (turn set, time nil) pair is the durable record of "we tried and it
 // did not land" — the state that otherwise looks identical to a healthy
 // session whose server page is merely lagging.
+//
+// resolved is the repo policy (repoDraftPolicy), the same one the Stop hook
+// applies. A recording that saved session_publishing: manual is held on this
+// machine and the hook never drafts it, so it reports "disabled" rather than a
+// "pending" that never arrives.
 func draftStateFor(resolved *config.ResolvedSessionDraft, s *session.RecordingState) string {
 	if s == nil {
 		return ""
 	}
-	if resolved == nil || !resolved.Enabled {
+	if resolved == nil || !resolved.Enabled || s.RecordedManualPublishing() {
 		return "disabled"
 	}
 	// Order matters: check the FAILED shape before the published shape.
@@ -283,17 +288,19 @@ func conversationURLForState(projectCfg *config.ProjectConfig, attributionOn boo
 // recording row, so `ox session status` reads each config file once rather than
 // once per active agent.
 type draftStatusContext struct {
-	resolved      *config.ResolvedSessionDraft
-	projectCfg    *config.ProjectConfig
-	attributionOn bool
+	resolved         *config.ResolvedSessionDraft
+	projectCfg       *config.ProjectConfig
+	attributionOn    bool
+	manualPublishing bool
 }
 
-func newDraftStatusContext() draftStatusContext {
-	projectCfg, _ := config.LoadProjectConfig("")
+func newDraftStatusContext(projectRoot string) draftStatusContext {
+	projectCfg, _ := config.LoadProjectConfig(projectRoot)
 	return draftStatusContext{
-		resolved:      config.ResolveSessionDraft(),
-		projectCfg:    projectCfg,
-		attributionOn: loadResolvedAttribution().Session != "",
+		resolved:         repoDraftPolicy(projectRoot),
+		projectCfg:       projectCfg,
+		attributionOn:    loadResolvedAttributionFor(projectRoot).Session != "",
+		manualPublishing: config.GetSessionPublishing(projectRoot) == config.SessionPublishingManual,
 	}
 }
 
@@ -307,7 +314,12 @@ func (c draftStatusContext) applyTo(s *session.RecordingState, turnCount *int, s
 	if s.DraftPublishedAt != nil {
 		*publishedAt = s.DraftPublishedAt.Format("2006-01-02T15:04:05Z07:00")
 	}
-	*url = conversationURLForState(c.projectCfg, c.attributionOn, s)
+	// A session held on this machine is never registered with the server, so
+	// its /c/ link would 404. Same rule as notifySessionStartedAsync: the mode
+	// saved at start or the setting now.
+	if !c.manualPublishing && !s.RecordedManualPublishing() {
+		*url = conversationURLForState(c.projectCfg, c.attributionOn, s)
+	}
 }
 
 func init() {
@@ -426,7 +438,7 @@ func runSessionStatus(cmd *cobra.Command, args []string) error {
 			}
 			// ADR-029: surface draft-placeholder state so "my /c/ link 404s"
 			// is diagnosable rather than a guess.
-			newDraftStatusContext().applyTo(state, &output.TurnCount, &output.DraftState,
+			newDraftStatusContext(projectRoot).applyTo(state, &output.TurnCount, &output.DraftState,
 				&output.DraftPublishedAt, &output.ConversationURL)
 			return outputJSON(cmd.OutOrStdout(), output)
 		}
@@ -485,7 +497,7 @@ func runSessionStatus(cmd *cobra.Command, args []string) error {
 	// multiple recordings
 	if jsonOutput {
 		// Loaded once for the whole invocation, not per row.
-		draftCtx := newDraftStatusContext()
+		draftCtx := newDraftStatusContext(projectRoot)
 		var entries []sessionRecordingEntry
 		for _, s := range states {
 			alive, status := agentLivenessFor(agentAlive, s.AgentID)
