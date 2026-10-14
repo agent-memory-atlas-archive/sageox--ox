@@ -21,6 +21,7 @@ import (
 
 	"github.com/chromedp/chromedp"
 	"github.com/sageox/ox/internal/plan"
+	"github.com/sageox/ox/pkg/planreview"
 )
 
 // frameCSP is the policy a host serves a framed plan under: an opaque origin
@@ -220,7 +221,7 @@ func TestBrowser_DocumentToolsInOpaqueFrame(t *testing.T) {
 		t.Fatalf("click the item: %v", err)
 	}
 	n = frameMessage(t, ctx, n, "target", &target)
-	want := plan.AnchorFor("Risks", "Retry budget is three")
+	want := planreview.AnchorFor("Risks", "Retry budget is three")
 	if target.Target.Anchor != want || target.Target.Section != "Risks" || target.Target.Label != "Retry budget is three" || target.Target.Quote != "" {
 		t.Fatalf("clicking the item named %+v, want anchor %s in Risks", target.Target, want)
 	}
@@ -242,7 +243,7 @@ func TestBrowser_DocumentToolsInOpaqueFrame(t *testing.T) {
 		t.Fatalf("drag over the phrase: %v", err)
 	}
 	n = frameMessage(t, ctx, n, "target", &target)
-	wantQ := "q" + strings.TrimPrefix(plan.AnchorFor("Risks", "retry path"), "h")
+	wantQ := "q" + strings.TrimPrefix(planreview.AnchorFor("Risks", "retry path"), "h")
 	if target.Target.Anchor != wantQ || target.Target.Quote != "retry path" {
 		t.Fatalf("highlighting the phrase named %+v, want %s with its words", target.Target, wantQ)
 	}

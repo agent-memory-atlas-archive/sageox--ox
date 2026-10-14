@@ -22,6 +22,7 @@ import (
 
 	"github.com/chromedp/chromedp"
 	"github.com/sageox/ox/internal/plan"
+	"github.com/sageox/ox/pkg/planreview"
 )
 
 // scriptedPost records every POST the page makes to one endpoint and answers
@@ -474,11 +475,7 @@ func jsString(s string) string { b, _ := json.Marshal(s); return string(b) }
 // with an inherited member and the note silently drops out of view.
 func TestBrowser_ReservedAnchorNoteStaysVisible(t *testing.T) {
 	base, planDir, _ := serveLivePlanReview(t)
-	if _, err := plan.SaveFeedback(planDir, plan.FeedbackSet{Reviewer: "Avery", Items: []plan.FeedbackItem{
-		{Anchor: "constructor", Label: "Rollout", Status: plan.FeedbackRequestChange, Note: "reserved anchor note"},
-	}}, time.Now()); err != nil {
-		t.Fatalf("save feedback: %v", err)
-	}
+	roundForTest(t, planDir, time.Now(), planreview.Item{Anchor: "constructor", Label: "Rollout", Status: planreview.StatusRequestChange, Note: "reserved anchor note"})
 	ctx := newChrome(t)
 	if err := chromedp.Run(ctx, chromedp.Navigate(base+"/"), chromedp.WaitVisible(".rev-toggle", chromedp.ByQuery)); err != nil {
 		t.Fatalf("open page: %v", err)
