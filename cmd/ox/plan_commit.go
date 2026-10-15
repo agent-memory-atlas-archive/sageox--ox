@@ -87,25 +87,21 @@ func commitPlanToLedger(gitRoot, planDir string) error {
 	if err != nil {
 		return err
 	}
+	// git run in a directory that is not a checkout finds any enclosing
+	// repository, and a retry marker would create a .git dir the daemon reads
+	// as a corrupt clone
+	if !gitutil.IsGitRepo(ledgerPath) {
+		return fmt.Errorf("ledger %s is not a git checkout", ledgerPath)
+	}
 	ctx := context.Background()
-	_, err = commitAndPushPlanDir(ctx, ledgerPath, planDir)
-	recordPlanPushOutcome(ctx, ledgerPath, planDir, err)
+	started := time.Now()
+	err = commitAndPushPlanDir(ctx, ledgerPath, planDir)
+	recordPlanPushOutcome(ctx, ledgerPath, planDir, started, err)
 	return err
 }
 
-// commitPlanToLedgerStatus is commitPlanToLedger for callers that must report
-// the outcome rather than just log it (the live review server's responses).
-func commitPlanToLedgerStatus(ctx context.Context, gitRoot, planDir string) planCommitStatus {
-	ledgerPath, err := planLedgerPathFor(gitRoot)
-	if err != nil {
-		return planCommitStatus{Err: err.Error()}
-	}
-	st, err := commitAndPushPlanDir(ctx, ledgerPath, planDir)
-	recordPlanPushOutcome(ctx, ledgerPath, planDir, err)
-	return st
-}
-
 // commitAndPushPlanDir stages planDir, commits ONLY that path, and pushes.
+// Given files (names in planDir), it stages and commits only those.
 //
 // Path-scoped on purpose: a bare `git commit` takes the whole index, so any
 // unrelated change someone else staged in the Ledger (a half-finished session
@@ -119,29 +115,131 @@ func commitPlanToLedgerStatus(ctx context.Context, gitRoot, planDir string) plan
 // Add+commit run under gitutil.WithRepoLock (cross-process) and planCommitMu
 // (in-process, held through the push as well). The push runs outside the repo
 // lock because PushWithRetry takes it itself when it must pull.
-func commitAndPushPlanDir(ctx context.Context, ledgerPath, planDir string) (planCommitStatus, error) {
+func commitAndPushPlanDir(ctx context.Context, ledgerPath, planDir string, files ...string) error {
 	planCommitMu.Lock()
 	defer planCommitMu.Unlock()
 
 	rel, err := ledgerRelPath(ledgerPath, planDir)
 	if err != nil {
-		return planCommitStatus{Err: err.Error()}, err
+		return err
 	}
-
-	if err := commitPlanLocalCtx(ctx, ledgerPath, planDir, ""); err != nil {
-		return planCommitStatus{Err: gitutil.SanitizeOutput(err.Error())}, err
+	err = gitutil.WithRepoLock(ctx, ledgerPath, func() error {
+		if len(files) == 0 {
+			return commitPlanDirLocked(ctx, ledgerPath, planDir, "")
+		}
+		return commitPlanPathsLocked(ctx, ledgerPath, "plan: "+filepath.Base(planDir), rel, files)
+	})
+	if err != nil {
+		return err
 	}
-
 	// Push even when the snapshot was a no-op: an earlier commit of this plan
 	// may be the one still waiting on a failed push.
-	st := planCommitStatus{Committed: true}
 	if err := pushLedger(ctx, ledgerPath); err != nil {
-		st.Err = gitutil.SanitizeOutput(err.Error())
-		return st, fmt.Errorf("push plan %s: %w", rel, err)
+		return fmt.Errorf("push plan %s: %w", rel, err)
 	}
-	st.Pushed = true
-	return st, nil
+	return nil
 }
+
+// errLedgerNotSafe: the Ledger is mid-rebase, locked, or holds unresolved
+// conflicts, so a plan write or commit was refused.
+var errLedgerNotSafe = errors.New("the Ledger needs repair before a plan can be written")
+
+// errEventNotCommitted: the plan event is recorded but its commit failed; its
+// files are left unstaged for a retry.
+var errEventNotCommitted = errors.New("plan event recorded but not committed")
+
+// planEventFiles are the files plan.AppendPlanEvent writes in a plan dir.
+var planEventFiles = []string{"events.jsonl", "meta.json"}
+
+// commitPlanEvent records a lifecycle event (approve, work, realize, abandon,
+// supersede) and commits exactly the files that writes, in one hold of the
+// repo lock: a pull never finds them half written, and nothing else in the
+// plan dir (an author's unsaved plan.md) rides along. While the Ledger needs
+// repair it records nothing (errLedgerNotSafe). The files are committed even
+// when the event changes nothing, since an earlier attempt's event may still
+// be waiting on a failed commit; a commit that fails returns
+// errEventNotCommitted. The caller holds planCommitMu and has checked that
+// ledgerPath is a git checkout.
+func commitPlanEvent(ctx context.Context, ledgerPath, planDir string, kind plan.EventKind, fields plan.PlanEventFields) (changed bool, err error) {
+	rel, err := ledgerRelPath(ledgerPath, planDir)
+	if err != nil {
+		return false, err
+	}
+	err = gitutil.WithRepoLock(ctx, ledgerPath, func() error {
+		if err := ledgerSafeForPlanWrite(ctx, ledgerPath); err != nil {
+			return err
+		}
+		var err error
+		if changed, err = plan.AppendPlanEvent(ctx, planDir, kind, fields); err != nil {
+			return err
+		}
+		if err := commitPlanPathsLocked(ctx, ledgerPath, "plan: "+string(kind)+" "+filepath.Base(planDir), rel, planEventFiles); err != nil {
+			return fmt.Errorf("%w: %w", errEventNotCommitted, err)
+		}
+		return nil
+	})
+	return changed, err
+}
+
+// commitPlanPathsLocked stages the named files of the plan dir at rel (those
+// that exist) and commits only them. On failure it unstages them, so no later
+// commit carries what this one refused. The caller holds the repo lock.
+func commitPlanPathsLocked(ctx context.Context, ledgerPath, msg, rel string, files []string) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), lockedCommitTimeout)
+	defer cancel()
+	if err := ledgerSafeForPlanWrite(ctx, ledgerPath); err != nil {
+		return err
+	}
+	var paths []string
+	for _, f := range files {
+		if _, err := os.Lstat(filepath.Join(ledgerPath, filepath.FromSlash(rel), f)); err == nil {
+			paths = append(paths, rel+"/"+f)
+		}
+	}
+	if len(paths) == 0 {
+		return nil
+	}
+	unstage := func() { _, _ = gitutil.RunGit(ctx, ledgerPath, append([]string{"reset", "-q", "--"}, paths...)...) }
+	if out, err := gitutil.RunGit(ctx, ledgerPath, append([]string{"add", "--sparse", "--"}, paths...)...); err != nil {
+		unstage()
+		return fmt.Errorf("git add %s failed: %s: %w", strings.Join(paths, " "), gitutil.SanitizeOutput(out), err)
+	}
+	if _, err := commitPlanSnapshot(ctx, ledgerPath, msg, paths...); err != nil {
+		unstage()
+		return fmt.Errorf("commit %s: %w", strings.Join(paths, " "), err)
+	}
+	return nil
+}
+
+// ledgerSafeForPlanWrite refuses (errLedgerNotSafe) while the Ledger is
+// mid-rebase, another git holds its locks, or its index holds unmerged
+// entries. A plan file written mid-rebase is reverted by the rebase's abort,
+// or makes the abort refuse, and `git add` of a conflicted path marks it
+// resolved with its conflict markers inside, erasing the conflict the daemon
+// and `ox doctor` look for. The caller holds the repo lock.
+func ledgerSafeForPlanWrite(ctx context.Context, ledgerPath string) error {
+	err := gitutil.IsSafeForGitOps(ledgerPath)
+	if err == nil {
+		var unmerged bool
+		if unmerged, err = gitutil.HasUnmergedEntries(ctx, ledgerPath); err == nil && unmerged {
+			err = errors.New("the index holds unresolved conflicts")
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("%w: %w", errLedgerNotSafe, err)
+	}
+	return nil
+}
+
+// lockedCommitTimeout bounds a plan commit made under the repo lock, which
+// ignores its caller's cancellation: git killed while it holds index.lock can
+// leave the lock behind, and an ownerless lock blocks every commit and pull on
+// the clone until it is an hour old (gitutil.AbandonedLockAge).
+const lockedCommitTimeout = 2 * time.Minute
+
+// commitPlanSnapshot is gitutil.CommitLedgerSnapshot, a variable so a test can
+// fail a plan commit after its files are written and staged.
+var commitPlanSnapshot = gitutil.CommitLedgerSnapshot
 
 // errReviewConflict: the operation is already stored with other content or
 // under another reviewer. Nothing was written, so the client keeps its draft.
@@ -369,6 +467,8 @@ func commitReviewRecord(ctx context.Context, ledgerPath string, e reviewPending,
 	path := e.PlanDir + "/" + e.Path
 	var oid string
 	err := gitutil.WithRepoLock(ctx, ledgerPath, func() error {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), lockedCommitTimeout)
+		defer cancel()
 		// git run in a directory that is not a checkout finds any enclosing
 		// repository and would stage the record there
 		if !gitutil.IsGitRepo(ledgerPath) {
@@ -466,23 +566,13 @@ func ledgerRelPath(ledgerPath, planDir string) (string, error) {
 	return filepath.ToSlash(rel), nil
 }
 
-// commitPlanLocal stages one plan dir and commits it to the ledger WITHOUT
-// pushing. See commitPlanLocalCtx.
-func commitPlanLocal(ledgerPath, planDir, msgPrefix string) error {
-	return commitPlanLocalCtx(context.Background(), ledgerPath, planDir, msgPrefix)
-}
-
-// commitPlanLocalCtx is the single plan add+commit path: it stages one plan dir
-// and commits it through the canonical gitutil.CommitLedgerSnapshot under
-// ADR-030's repo lock, without pushing. msgPrefix defaults to "plan: ".
-// "Nothing to commit" is success (an idempotent re-save).
-//
-// Path-scoped on purpose: the ledger index can hold unrelated staged files
-// (the daemon's data/github imports were observed staged in the field), and a
-// bare `git commit` sweeps them into a "plan:" commit. CommitLedgerSnapshot
-// commits the exact index entries under the pathspec as an immutable tree,
-// unlike `git commit -- <path>`, which re-reads the worktree at commit time.
-func commitPlanLocalCtx(ctx context.Context, ledgerPath, planDir, msgPrefix string) error {
+// commitPlanDirLocked stages one plan dir and commits it through
+// commitPlanSnapshot, for a caller that holds the repo lock. msgPrefix
+// defaults to "plan: ". "Nothing to commit" is success (an idempotent
+// re-save).
+func commitPlanDirLocked(ctx context.Context, ledgerPath, planDir, msgPrefix string) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), lockedCommitTimeout)
+	defer cancel()
 	rel, err := ledgerRelPath(ledgerPath, planDir)
 	if err != nil {
 		return err
@@ -490,37 +580,32 @@ func commitPlanLocalCtx(ctx context.Context, ledgerPath, planDir, msgPrefix stri
 	if msgPrefix == "" {
 		msgPrefix = "plan: "
 	}
-	// ensure .gitignore is in place before any commit to prevent cache leakage
+	if err := ledgerSafeForPlanWrite(ctx, ledgerPath); err != nil {
+		return err
+	}
+	// ensure .gitignore is in place before any commit to prevent cache
+	// leakage. It stages and untracks files, so it runs after the check.
 	gitserver.EnsureGitignoreBeforeCommitCtx(ctx, ledgerPath)
-
-	return gitutil.WithRepoLock(ctx, ledgerPath, func() error {
-		// Mid-rebase safety belongs at index-mutation time, not just push time:
-		// an unguarded `git add` during a conflicted rebase marks the conflict
-		// resolved (see .claude/rules/cache-only-design.md).
-		if err := gitutil.IsSafeForGitOps(ledgerPath); err != nil {
-			return fmt.Errorf("ledger not safe for plan commit (%s): %w", ledgerPath, err)
+	// --sparse: ledger repos use sparse-checkout (cone mode).
+	addArgs := []string{"add", "--sparse", "--", rel}
+	if planHTMLAwaitingUpload(planDir) {
+		// a large plain plan.html left by a failed upload must never be committed:
+		// it would bury multi-megabyte HTML in history and the pointer retry would
+		// then find nothing to dehydrate
+		addArgs = append(addArgs, ":(exclude)"+rel+"/"+planHTMLFileName)
+		// an earlier add may already have staged the plain page; the exclude
+		// above does not touch the index, so unstage it explicitly
+		if out, err := gitutil.RunGit(ctx, ledgerPath, "reset", "-q", "--", rel+"/"+planHTMLFileName); err != nil {
+			return fmt.Errorf("unstage pending %s: %s: %w", planHTMLFileName, gitutil.SanitizeOutput(out), err)
 		}
-		// --sparse: ledger repos use sparse-checkout (cone mode).
-		addArgs := []string{"add", "--sparse", "--", rel}
-		if planHTMLAwaitingUpload(planDir) {
-			// a large plain plan.html left by a failed upload must never be committed:
-			// it would bury multi-megabyte HTML in history and the pointer retry would
-			// then find nothing to dehydrate
-			addArgs = append(addArgs, ":(exclude)"+rel+"/"+planHTMLFileName)
-			// an earlier add may already have staged the plain page; the exclude
-			// above does not touch the index, so unstage it explicitly
-			if out, err := gitutil.RunGit(ctx, ledgerPath, "reset", "-q", "--", rel+"/"+planHTMLFileName); err != nil {
-				return fmt.Errorf("unstage pending %s: %s: %w", planHTMLFileName, gitutil.SanitizeOutput(out), err)
-			}
-		}
-		if out, err := gitutil.RunGit(ctx, ledgerPath, addArgs...); err != nil {
-			return fmt.Errorf("git add %s failed: %s: %w", rel, gitutil.SanitizeOutput(out), err)
-		}
-		if _, err := gitutil.CommitLedgerSnapshot(ctx, ledgerPath, msgPrefix+filepath.Base(planDir), rel); err != nil {
-			return fmt.Errorf("commit plan %s: %w", rel, err)
-		}
-		return nil
-	})
+	}
+	if out, err := gitutil.RunGit(ctx, ledgerPath, addArgs...); err != nil {
+		return fmt.Errorf("git add %s failed: %s: %w", rel, gitutil.SanitizeOutput(out), err)
+	}
+	if _, err := commitPlanSnapshot(ctx, ledgerPath, msgPrefix+filepath.Base(planDir), rel); err != nil {
+		return fmt.Errorf("commit plan %s: %w", rel, err)
+	}
+	return nil
 }
 
 // commitPlanBackfillToLedger stages every backfilled plan rename, in-place

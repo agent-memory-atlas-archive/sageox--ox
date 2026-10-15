@@ -92,16 +92,8 @@ func reviewSaveDraft(cmd *cobra.Command, file string) (string, error) {
 		return "", fmt.Errorf("review --file needs a ledger with plan capture enabled (run `ox init`)")
 	}
 	result := plan.Enrich(context.Background(), in, gitRoot)
-	dir := savePlanWithProvenance(gitRoot, in, result, nil)
-	if dir == "" {
+	if savePlanArtifacts(gitRoot, in, result, nil, "", withCompanions(gatherCompanions(cmd, in))) == "" {
 		return "", fmt.Errorf("could not save draft to the ledger")
-	}
-	if companions := gatherCompanions(cmd, in); len(companions) > 0 {
-		if names, cerr := plan.CopyCompanions(companions, dir); cerr != nil {
-			cli.PrintHint("could not bundle companion(s): " + cerr.Error())
-		} else if rerr := plan.RecordCompanions(dir, names); rerr != nil {
-			cli.PrintHint("could not record companion(s) in plan meta: " + rerr.Error())
-		}
 	}
 	return plan.Slugify(planTopic(in)), nil
 }
@@ -554,17 +546,16 @@ func liveReviewHandlerWithActivity(gitRoot, slug, planDir, base, token string, b
 	})
 
 	post("/approve", func(ctx context.Context, body []byte) (map[string]any, int, error) {
-		// Same engine `ox plan approve` uses (internal/plan/lifecycle.go) — a
-		// browser Approve click and the CLI verb are one mechanism, never two.
+		// Same engine `ox plan approve` uses (sharePlanEvent) — a browser
+		// Approve click and the CLI verb are one mechanism, never two.
 		// changed is only used to gate the best-effort activity notify below;
 		// the response here always reports success regardless of its value —
 		// an already-approved plan re-approving via a stale/duplicate click
-		// must still report success, matching SetStatus's prior
-		// always-succeeds contract.
-		fields := planEventFieldsFromProvenance(gitRoot)
-		eventCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		defer cancel()
-		changed, err := plan.AppendPlanEvent(eventCtx, planDir, plan.EventApproved, fields)
+		// must still report success.
+		changed, st, err := sharePlanEvent(ctx, gitRoot, planDir, plan.EventApproved, planEventFieldsFromProvenance(gitRoot))
+		if errors.Is(err, errLedgerNotSafe) {
+			return nil, http.StatusServiceUnavailable, err
+		}
 		if err != nil {
 			return nil, http.StatusInternalServerError, err
 		}
@@ -575,7 +566,7 @@ func liveReviewHandlerWithActivity(gitRoot, slug, planDir, base, token string, b
 			// unreachable activity-index endpoint.
 			go postPlanActivityBestEffort(gitRoot, planDir, plan.EventApproved)
 		}
-		resp := planCommitFields(commitPlanForReview(ctx, gitRoot, planDir))
+		resp := planCommitFields(planCommitStatus{Committed: st.Committed, Pushed: st.Pushed})
 		select {
 		case approved <- struct{}{}:
 		default:
@@ -642,20 +633,6 @@ func reviewWriteErrorCode(err error) int {
 		return http.StatusConflict
 	}
 	return http.StatusInternalServerError
-}
-
-// commitPlanForReview commits + pushes the whole plan dir after /approve's
-// lifecycle write and returns the outcome for the response. Non-fatal by
-// design: the event is already on disk, a failure leaves a pending marker that
-// `ox agent prime` retries, and the page is told committed/pushed=false
-// instead of a silent 200.
-func commitPlanForReview(ctx context.Context, gitRoot, planDir string) planCommitStatus {
-	st := commitPlanToLedgerStatus(ctx, gitRoot, planDir)
-	if !st.Pushed {
-		slog.WarnContext(ctx, "plan review: feedback saved locally, ledger commit/push deferred",
-			"dir", planDir, "committed", st.Committed, "error", st.Err)
-	}
-	return st
 }
 
 // planCommitFields is the durability half of every review POST response.

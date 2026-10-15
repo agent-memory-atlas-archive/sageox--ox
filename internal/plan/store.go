@@ -278,7 +278,9 @@ func priorSaveOfSource(ledger, sourcePath string) (string, Meta, bool) {
 		if err != nil || m.SourcePlanPath != sourcePath {
 			continue
 		}
-		if isClosedStatus(m.Status) {
+		// the folded status, as every closed-plan check here: meta.json's
+		// snapshot can lag the event log after two clones race
+		if isClosedStatus(CurrentStatus(dir)) {
 			continue
 		}
 		// Most recent wins when a source path has been saved more than once.
@@ -400,6 +402,7 @@ func Save(gitRoot string, in Input, res Result, html []byte, meta Meta) (string,
 		// original CreatedAt, while refreshing the rest. Routing through
 		// MutatePlanMeta also serializes against a concurrent session-stop/
 		// doctor outcome write to the same file.
+		var status PlanStatus // meta.json's, after this save
 		if err := MutatePlanMeta(context.Background(), dir, func(existing *Meta) (*Meta, error) {
 			merged := meta
 			if existing != nil {
@@ -442,6 +445,7 @@ func Save(gitRoot string, in Input, res Result, html []byte, meta Meta) (string,
 			if merged.Status == "" {
 				merged.Status = PlanStatusDraft
 			}
+			status = merged.Status
 			merged.SchemaVersion = SchemaVersion
 			return &merged, nil
 		}); err != nil {
@@ -502,7 +506,9 @@ func Save(gitRoot string, in Input, res Result, html []byte, meta Meta) (string,
 		ev := Event{PlanID: planID, Kind: EventRevised, Topic: meta.Topic}
 		if firstSave {
 			ev.Kind = EventCreated
-			ev.Status = PlanStatusDraft
+			// draft, or the status a legacy plan's meta.json held before it
+			// had events: from now on the status is folded from them
+			ev.Status = status
 		}
 		savedKind = ev.Kind
 		if meta.Provenance != nil {
@@ -846,22 +852,6 @@ func MutatePlanMeta(ctx context.Context, planDir string, mutate func(*Meta) (*Me
 			return fmt.Errorf("marshal plan meta: %w", err)
 		}
 		return fileutil.AtomicWriteBytes(metaPath, data, 0o644)
-	})
-}
-
-// SetStatus updates a saved plan's lifecycle status (by slug) under the meta
-// flock. No-op if the plan dir has no meta.json. Use the PlanStatus* constants.
-func SetStatus(gitRoot, slug string, status PlanStatus) error {
-	dir, err := resolvePlanDirForSlug(gitRoot, slug)
-	if err != nil {
-		return err
-	}
-	return MutatePlanMeta(context.Background(), dir, func(m *Meta) (*Meta, error) {
-		if m == nil {
-			return nil, nil
-		}
-		m.Status = status
-		return m, nil
 	})
 }
 
