@@ -13,7 +13,7 @@
 import { clip } from './anchor.js';
 import { CHROME, typing } from './document-tools.js';
 import type { HostPort } from './ports.js';
-import type { PaintItem, Placed, State, Status, Tint } from './protocol.js';
+import { paintItem, STATES, STATUSES, type PaintItem, type Placed, type State, type Status, type Tint } from './protocol.js';
 import { acceptBody, deliver, newId, openStore, queued, reopenBody, submitBody, syncMessage, wireItem, type Act, type Approval, type Entry, type Mark, type Receipt, type SyncMessage, type Transport } from './state.js';
 
 /** One committed review item, as the page's review-state island carries it (buildReviewState in internal/plan). */
@@ -26,6 +26,8 @@ export interface CommittedItem {
   state: State;
   note?: string;
   reviewer?: string;
+  /** The author's note on the item's latest resolution, while it stands. */
+  resolutionNote?: string;
 }
 
 export interface HostControlsOptions {
@@ -46,8 +48,10 @@ export interface HostControlsOptions {
   resolve?: boolean;
   /** Stamp the plan approved: offered as the bar's Approve. */
   approve?: () => Promise<Approval>;
-  /** The frame holding the plan, when the document tools run in one: target rects are in its viewport. */
+  /** The frame holding the plan, when the document tools run in one: target rects are in its viewport, and the controls sit over its box instead of the window's. */
   frame?: HTMLIFrameElement;
+  /** Open in review mode, for a host that mounts the controls because the reviewer asked to review. */
+  reviewing?: boolean;
   /** How to bring the host back, shown with a copy button while it is offline. */
   restartCommand?: string;
 }
@@ -82,6 +86,7 @@ interface Row {
   state: string;
   reviewer: string;
   tag: '' | 'unsent' | 'queued' | 'unsaved';
+  answer: string; // the author's resolution note
 }
 type Kind = SyncMessage['kind'] | 'info' | 'pending' | 'ask';
 type Action = { label: string; fn: (input?: string) => void };
@@ -98,11 +103,13 @@ const HL_TINT: Record<string, Tint> = { 'approve': 'sage', 'request-change': 'am
 const WHOLE: About = { a: 'plan', section: '', label: 'Whole plan' };
 const BUBBLE = '<svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 2.5h10A1.5 1.5 0 0 1 14.5 4v6a1.5 1.5 0 0 1-1.5 1.5H7.5L4 14.5v-3H3A1.5 1.5 0 0 1 1.5 10V4A1.5 1.5 0 0 1 3 2.5z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>';
 
-// esc makes untrusted text safe in element content and in double-quoted
-// attributes: a status read back from the Ledger is not validated.
+// esc makes untrusted text safe in element content and in quoted attributes.
 export function esc(s: string | undefined): string {
-  return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+  return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
+// A rail tag's class names a resolution state; anything else gets none.
+const STATE_TAG: Record<string, string> = { addressed: 'addressed', verified: 'verified', wontfix: 'wontfix' };
+const TEXT_FIELDS = ['section', 'label', 'quote', 'note', 'reviewer', 'resolutionNote'] as const;
 function glyphFor(id: string): string {
   for (let i = 0; i < STATUS.length; i++) if (STATUS[i].id === id) return STATUS[i].glyph;
   return '◌';
@@ -133,12 +140,22 @@ export function mountHostControls(port: HostPort, opts: HostControlsOptions): Ho
   const signal = off.signal;
 
   let problems = opts.problems || 0;
+  let invalid = 0; // committed items left out: a status or state outside the contract
   // anchor -> [mark, …]: multi-user, so several reviewers on one anchor all
   // show. No prototype: a stored anchor named "constructor" is just a key.
   let committed: Record<string, CommittedItem[]> = Object.create(null);
+  // Ledger records are member-written. An item with a status or state the
+  // contract doesn't name would reach the rail's markup and fail every paint,
+  // so it is left out and counted as a problem reading the review.
   function setCommitted(items: CommittedItem[]) {
     committed = Object.create(null);
-    items.forEach((x) => { (committed[x.anchor] = committed[x.anchor] || []).push(x); });
+    invalid = 0;
+    items.forEach((x) => {
+      // a member wrote the record: one of the wrong shape would stop the rail drawing
+      if (!x || typeof x.anchor !== 'string' || STATUSES.indexOf(x.status) < 0 || STATES.indexOf(x.state) < 0 ||
+          TEXT_FIELDS.some((k) => x[k] !== undefined && typeof x[k] !== 'string')) { invalid++; return; }
+      (committed[x.anchor] = committed[x.anchor] || []).push(x);
+    });
   }
   setCommitted(opts.committed);
   // a host without sign-in: the name the reviewer gave, sent with each request
@@ -182,13 +199,16 @@ export function mountHostControls(port: HostPort, opts: HostControlsOptions): Ho
       // a highlight is found by its words: your mark's, else the first committed one's
       const q = m && m.quote ? m : carr.filter((x) => x.quote)[0];
       if (q && q.quote) { it.quote = q.quote; it.section = q.section || ''; if (q.label) it.label = q.label; }
-      out.push(it);
+      // one item the protocol refuses would drop the whole paint
+      const ok = paintItem(it);
+      if (ok) out.push(ok);
     });
     return out;
   }
 
   function paint() {
     if (destroyed) return;
+    place();
     ds = Object.create(null);
     store.drafts().forEach((m) => { ds[m.anchor] = m; });
     const n = Object.keys(ds).length;
@@ -196,11 +216,12 @@ export function mountHostControls(port: HostPort, opts: HostControlsOptions): Ho
     port.send({ type: 'paint', items: paintItems() }); // answered by 'placed'
   }
   function onPlaced(items: Placed[]) {
-    placed = items;
     // the whole plan names nothing on the page, so it is never unplaced
     const seen: Record<string, boolean> = Object.create(null);
     seen[WHOLE.a] = true;
-    placed.forEach((p) => { seen[p.anchor] = true; });
+    // one row per comment, however often the page repeats its anchor: the
+    // plan's own scripts can send this answer with 10,000 copies of one
+    placed = items.filter((p) => !seen[p.anchor] && (seen[p.anchor] = true));
     // comments whose text is gone from the page — rewritten by the agent, or
     // edited while this tab was away — keep a rail row, so an addressed one can
     // still be accepted or reopened
@@ -216,10 +237,11 @@ export function mountHostControls(port: HostPort, opts: HostControlsOptions): Ho
   function renderOrphans(orphans: CommittedItem[]) {
     if (orphanBar) { orphanBar.remove(); orphanBar = null; }
     const open = orphans.filter((o) => o.state === 'open');
-    if (!open.length && !problems) return;
+    const n = problems + invalid;
+    if (!open.length && !n) return;
     const bar = orphanBar = document.createElement('div');
     bar.className = 'rev-orphans';
-    let html = problems ? '<div class="rev-orphans-h">⚠ This review could not be fully read or holds conflicting copies (' + problems + ' problem(s)): notes may be missing or shown resolved.</div>' : '';
+    let html = n ? '<div class="rev-orphans-h">⚠ This review could not be fully read or holds conflicting copies (' + n + ' problem(s)): notes may be missing or shown resolved.</div>' : '';
     if (open.length) {
       const items = open.map((o) => '<li><strong>' + esc(o.status) + '</strong> ' + esc(o.label || o.anchor) + (o.note ? ' — ' + esc(o.note) : '') + '</li>').join('');
       html += '<div class="rev-orphans-h">⚠ ' + open.length + ' review note(s) no longer anchored (the text changed) — still open:</div><ul>' + items + '</ul>';
@@ -255,6 +277,7 @@ export function mountHostControls(port: HostPort, opts: HostControlsOptions): Ho
           at, a, quote, status: c.status, note: c.note,
           section: c.section || section, label: c.label || label,
           state: c.state, reviewer: c.reviewer || '', tag: '',
+          answer: c.state !== 'open' && c.resolutionNote ? c.resolutionNote : '',
         });
       });
       const m = ds[a];
@@ -264,15 +287,12 @@ export function mountHostControls(port: HostPort, opts: HostControlsOptions): Ho
           section: m.section || section, label: m.label || label,
           state: '', reviewer: who() || '(you)',
           tag: store.unsaved(a) ? 'unsaved' : queued(waiting, m) ? 'queued' : 'unsent',
+          answer: '',
         });
       }
     }
     add(null, WHOLE.a, WHOLE.section, WHOLE.label, '');
-    const nth: Record<string, number> = Object.create(null);
-    placed.forEach((p) => {
-      const k = nth[p.anchor] = (nth[p.anchor] === undefined ? 0 : nth[p.anchor] + 1);
-      add({ anchor: p.anchor, nth: k }, p.anchor, p.section, p.label, p.quote || '');
-    });
+    placed.forEach((p) => add({ anchor: p.anchor, nth: 0 }, p.anchor, p.section, p.label, p.quote || ''));
     unplaced.forEach((a) => {
       const m = ds[a];
       const its: Array<CommittedItem | Mark> = (committed[a] || []).concat(m ? [m as unknown as CommittedItem] : []);
@@ -289,7 +309,7 @@ export function mountHostControls(port: HostPort, opts: HostControlsOptions): Ho
         const t = ev.target as Element;
         if (t.closest('.rev-rail-show, .rev-rail-hide')) toggleRail();
         const plan = t.closest('.rev-rail-plan');
-        if (plan) { const b = plan.getBoundingClientRect(); openPop(WHOLE, { left: b.left, bottom: b.bottom }, true); }
+        if (plan) { const b = plan.getBoundingClientRect(); openPop(WHOLE, { left: b.left, bottom: b.bottom }, true); popByHost = true; }
       });
     }
     const r = rail;
@@ -313,13 +333,14 @@ export function mountHostControls(port: HostPort, opts: HostControlsOptions): Ho
       const whole = row.a === WHOLE.a; // on no element: its heading names it, and it has no text to change
       let tag = '';
       if (row.tag) tag = '<span class="rev-rail-tag ' + row.tag + '">' + row.tag + '</span>';
-      else if (row.state && row.state !== 'open') tag = '<span class="rev-rail-tag ' + esc(row.state) + '">' + esc(row.state) + '</span>';
+      else if (STATE_TAG[row.state]) tag = '<span class="rev-rail-tag ' + STATE_TAG[row.state] + '">' + STATE_TAG[row.state] + '</span>';
       if (!row.at && !whole) tag += '<span class="rev-rail-tag">text changed</span>';
       // a highlight's row leads with its words; its label is those words, so a
       // note-less highlight shows nothing more
       const content = (row.quote ? '<div class="rev-rail-quote">' + esc(row.label) + '</div>' : '') +
         (row.note ? '<div class="rev-rail-note">' + esc(row.note) + '</div>'
-          : row.quote || whole ? '' : '<div class="rev-rail-note muted">' + esc(row.label) + '</div>');
+          : row.quote || whole ? '' : '<div class="rev-rail-note muted">' + esc(row.label) + '</div>') +
+        (row.answer ? '<div class="rev-rail-answer">↳ ' + esc(row.answer) + '</div>' : '');
       const whoTag = row.reviewer ? '<span class="rev-rail-who">' + esc(row.reviewer) + '</span>' : '';
       html += '<li class="rev-rail-item" data-i="' + i + '" data-status="' + esc(row.status) + '">' +
         '<span class="rev-rail-glyph">' + glyphFor(row.status) + '</span>' +
@@ -332,16 +353,27 @@ export function mountHostControls(port: HostPort, opts: HostControlsOptions): Ho
         const row = rows[+(li.getAttribute('data-i') as string)];
         if (!row) return;
         // nothing on the page to scroll to: open the comment from its row
-        if (!row.at) { openPop({ a: row.a, section: row.section, label: row.label, quote: row.quote }, { left: ev.clientX, bottom: ev.clientY }); ev.stopPropagation(); return; }
+        if (!row.at) { openPop({ a: row.a, section: row.section, label: row.label, quote: row.quote }, { left: ev.clientX, bottom: ev.clientY }); popByHost = true; ev.stopPropagation(); return; }
         port.send({ type: 'reveal', anchor: row.at.anchor, nth: row.at.nth });
       };
     });
   }
 
   let pop: HTMLElement | null = null;
+  let popNote = ''; // the open note's text when it opened
+  let popByHost = false; // opened from the rail, not by a pick in the plan's frame
   function sendMode() { port.send({ type: 'mode', on, open: !!pop }); }
+  // The open note is held when the reviewer opened it from the rail or typed
+  // in it: only their own Esc, Save or Delete ends it, never the plan's frame.
+  // A plan that closed every note it could would leave no way to object, and
+  // the rail's notes are the ones it cannot open.
+  function held(): boolean {
+    const n = pop ? pop.querySelector('.rev-note') as HTMLTextAreaElement | null : null;
+    return !!pop && (popByHost || (!!n && n.value.trim() !== popNote));
+  }
   // replacing: another note opens in its place, so a waiting reload keeps waiting
   function closePop(replacing?: boolean) {
+    popByHost = false;
     if (pop) { pop.remove(); pop = null; sendMode(); }
     port.send({ type: 'focus', anchor: null });
     if (!replacing) idle();
@@ -354,13 +386,15 @@ export function mountHostControls(port: HostPort, opts: HostControlsOptions): Ho
     const a = t.a;
     const cstate = committedState(a);
     const p = pop = document.createElement('div'); p.className = 'rev-pop';
-    // a highlight's note names its words: the page selection is gone once the
-    // reviewer clicks into the note, so the focus highlight keeps them visible too
-    const quote = t.quote ? '<div class="rev-quote">' + esc(t.label) + '</div>' : '';
+    // What the note is about stays in view: a highlight's words (the page
+    // selection is gone once the reviewer clicks into the note), else the
+    // element's label, so a note is never filed under something unseen.
+    const quote = '<div class="' + (t.quote ? 'rev-quote' : 'rev-about') + '">' + esc(clip(t.label || t.a, 280)) + '</div>';
     port.send({ type: 'focus', anchor: a });
     // a committed, addressed/verified item gets Accept/Reopen (close the loop)
     // when this reviewer may resolve; everything else gets the mark-up controls.
     if (live && opts.resolve && !fresh && (cstate === 'addressed' || cstate === 'verified')) {
+      popNote = '';
       p.innerHTML = quote + '<div class="rev-cap">Agent marked this ' + cstate + '.</div>' +
         '<textarea class="rev-note" placeholder="reopen note (optional)"></textarea>' +
         '<div class="rev-row"><button class="rev-accept">Accept</button><button class="rev-reopen">Reopen</button></div>';
@@ -370,6 +404,7 @@ export function mountHostControls(port: HostPort, opts: HostControlsOptions): Ho
       return;
     }
     const existing = ds[a] || { status: 'request-change', note: '' };
+    popNote = existing.note || '';
     const btns = STATUS.map((s) => '<button data-s="' + s.id + '" class="rev-s' + (existing.status === s.id ? ' on' : '') + '">' + s.glyph + ' ' + s.id + '</button>').join('');
     p.innerHTML = quote + '<div class="rev-row">' + btns + '</div>' +
       '<textarea class="rev-note" placeholder="note (optional)">' + esc(existing.note || '') + '</textarea>' +
@@ -387,6 +422,23 @@ export function mountHostControls(port: HostPort, opts: HostControlsOptions): Ho
       if (!kept) showSync('err', 'This browser could not save your note: it lives in this tab only and is lost when the tab closes. Free up browser storage, then save it again.');
     };
     (p.querySelector('.rev-del') as HTMLElement).onclick = () => { store.remove(a); paint(); closePop(); };
+  }
+  // The box the controls sit over: the plan's frame, else the window.
+  function box() {
+    return opts.frame ? opts.frame.getBoundingClientRect() : { left: 0, top: 0, right: window.innerWidth, bottom: window.innerHeight };
+  }
+  // A framed plan is the reader's page: the controls sit over the frame's box,
+  // as they sit over the window on ox's own page, so the host's chrome around
+  // the frame stays clear. host.css reads these properties under .rev-framed.
+  function place() {
+    if (!opts.frame || destroyed) return;
+    const r = opts.frame.getBoundingClientRect();
+    const top = Math.max(r.top, 0), bottom = Math.min(r.bottom, window.innerHeight);
+    const v: Record<string, number> = {
+      top, left: Math.max(r.left, 0), right: Math.max(window.innerWidth - r.right, 0),
+      bottom: Math.max(window.innerHeight - bottom, 0), width: Math.max(r.width, 0), height: Math.max(bottom - top, 0),
+    };
+    Object.keys(v).forEach((k) => body.style.setProperty('--rev-' + k, v[k] + 'px'));
   }
   // The note opens just below where the reviewer acted, never over it.
   function placePop(rect: { left: number; bottom: number }) {
@@ -619,6 +671,16 @@ export function mountHostControls(port: HostPort, opts: HostControlsOptions): Ho
     if (waiter && !inflight && !pop) { const fn = waiter; waiter = null; fn(); }
   }
 
+  if (opts.frame) {
+    body.classList.add('rev-framed');
+    place();
+    window.addEventListener('resize', place, { signal });
+    // a host's own scroller moves the frame without a window scroll
+    document.addEventListener('scroll', place, { capture: true, passive: true, signal });
+  }
+  const resized = opts.frame && typeof ResizeObserver !== 'undefined' ? new ResizeObserver(place) : null;
+  if (resized && opts.frame) resized.observe(opts.frame);
+
   // controls
   const bar = document.createElement('div');
   bar.className = 'rev-bar';
@@ -683,7 +745,7 @@ export function mountHostControls(port: HostPort, opts: HostControlsOptions): Ho
 
   // first-visit discoverability: a one-time pointer at the Review toggle.
   try {
-    if (!localStorage.getItem('ox-plan-rev-seen')) {
+    if (!opts.reviewing && !localStorage.getItem('ox-plan-rev-seen')) {
       const hint = hintBubble = document.createElement('div');
       hint.className = 'rev-hint';
       hint.textContent = '↓ Click Review to mark up this plan';
@@ -717,28 +779,36 @@ export function mountHostControls(port: HostPort, opts: HostControlsOptions): Ho
         // A live reload — the agent addressed an item, or the server came back — must
         // not drop a reviewer mid-review back to reading mode. Restored silently: the
         // reviewer did not just enter, so no entry toast.
-        try { if (sessionStorage.getItem(ON_KEY)) setReview(true, true); } catch (e) { /* starts in reading mode */ }
+        try { if (!on && sessionStorage.getItem(ON_KEY)) setReview(true, true); } catch (e) { /* starts in reading mode */ }
         break;
       case 'placed':
         onPlaced(m.items);
         break;
       case 'target': {
-        // a framed document's rect is in the frame's viewport: move it into this one
-        const f = opts.frame ? opts.frame.getBoundingClientRect() : { left: 0, top: 0 };
-        openPop({ a: m.target.anchor, section: m.target.section, label: m.target.label, quote: m.target.quote },
-          { left: m.target.rect.left + f.left, bottom: m.target.rect.bottom + f.top });
+        // The document picks only in review mode, so any other target came
+        // from the plan's own scripts, as does one replacing a note in progress.
+        if (!on || held()) break;
+        // a framed document's rect is in the frame's viewport: move it into
+        // this one, and keep the whole note (about 300 x 200) over the frame
+        // wherever the plan says
+        const b = box();
+        openPop({ a: m.target.anchor, section: m.target.section, label: m.target.label, quote: m.target.quote }, {
+          left: Math.min(Math.max(m.target.rect.left + b.left, b.left), Math.max(b.left, b.right - 300)),
+          bottom: Math.min(Math.max(m.target.rect.bottom + b.top, b.top), Math.max(b.top, b.bottom - 200)),
+        });
         break;
       }
       case 'refused':
-        closePop();
+        if (!held()) closePop();
         toast(m.reason === 'repeated'
           ? '“' + clip(m.quote, 40) + '” appears ' + m.count + ' times in this section — highlight a longer phrase so the comment points at one place.'
           : 'Highlight text within one section to comment on it.');
         break;
       case 'dismiss':
-        if (on || pop) closePop();
+        if ((on || pop) && !held()) closePop();
         break;
       case 'key':
+        if (held()) break;
         if (m.key === 'Escape') escape();
         else setReview(!on);
         break;
@@ -746,6 +816,12 @@ export function mountHostControls(port: HostPort, opts: HostControlsOptions): Ho
   });
 
   restoreSync();
+  if (opts.reviewing) {
+    // the entry toast teaches the mode once; after that it is noise
+    let seen = true;
+    try { seen = !!localStorage.getItem('ox-plan-rev-seen'); } catch (e) { /* no storage: quiet */ }
+    setReview(true, seen);
+  }
   paint();
   // unsent marks that survived a restart or reload — tell the reviewer.
   const restored = Object.keys(ds).length;
@@ -773,8 +849,10 @@ export function mountHostControls(port: HostPort, opts: HostControlsOptions): Ho
       port.listen(() => {});
       port.send({ type: 'mode', on: false, open: false });
       port.send({ type: 'paint', items: [] });
+      if (resized) resized.disconnect();
       [bar, rail, orphanBar, syncEl, toastEl, offlineBar, hintBubble].forEach((el) => { if (el) el.remove(); });
-      body.classList.remove('rev-on', 'rev-offline');
+      body.classList.remove('rev-on', 'rev-offline', 'rev-framed');
+      ['top', 'left', 'right', 'bottom', 'width', 'height'].forEach((k) => body.style.removeProperty('--rev-' + k));
     },
   };
 }
