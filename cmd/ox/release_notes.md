@@ -9,12 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### New
 
+- **Apps can read every ox setting from ox itself** — `ox config schema --json` lists each setting with a short label and description, the values it accepts, the levels you can set it at, and its current value. It works outside a repository, so the SageOx desktop app can show your user-level ox settings without keeping its own copy of the list.
 - **Oxy does more while Claude works** — seven new animations, and more variety in the ones you see. A test run has him swatting a bug, a push or new PR launches a rocket, a web search pops browser tabs, reads and searches get his magnifying glass, and two failed tool calls in a row end with a smashed laptop. Ordinary tool calls pick from the laptop, robot, soccer juggle, tail wag, handheld, and Mario jump, so the laptop no longer fills the whole turn.
 - **Read a Visual walkthrough as joined moments** — `ox walkthrough` pairs each click, selection and pause with what was said and what happened next, shows zoomed pictures on request, and splits long recordings into chapters you can read one at a time. Recordings without this data read as before.
 - **Comment on a plan as a whole** — in review mode, the comments panel takes a comment on a plan's direction, scope or readiness without pinning it to a section. It reaches the AI coworker like any other comment.
 
 ### Fixed
 
+- **`ox config --help` lists the settings ox actually has** — the list is now built from the same registry `ox config set` uses. It had advertised `murmuring` and `github_sync*`, which `ox config set` rejects, and left out `murmur_send`, `murmur_receive` and eleven other settings.
 - **Oxy stays a crisp picture after `/clear` or a resume** — in Ghostty and kitty he no longer falls back to blocky half-block cells once you clear or switch sessions, and he keeps the size you chose and stays hidden if you hid him.
 - **A plan's tabs work while you review it** — clicking a plan's own tabs, checkboxes or collapsible notes in review mode switches or opens them, instead of starting a comment on the section around them.
 - **Review starts on your first click** — the tip that points new reviewers at Review now sits above the review bar, not on it, where it swallowed clicks on Review and the buttons beside it.
