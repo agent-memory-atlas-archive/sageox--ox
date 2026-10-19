@@ -278,8 +278,12 @@ Each workspace (repo) gets its own daemon instance:
 │  │             │        repo_type}}             │             │                 │
 │  │             │ ◀─ {progress updates} ───────  │             │                 │
 │  │             │ ◀─ {success, path} ──────────  │             │                 │
-│  └─────────────┘        (60s timeout)           └─────────────┘                 │
+│  └─────────────┘     (60s idle timeout)         └─────────────┘                 │
 │  Purpose: Clone a new repo (ledger or team context)                            │
+│  Idle: deadline resets on each progress update; a Ledger download reports      │
+│     every few seconds. Quiet past it = ErrCheckoutInProgress: a Ledger clone   │
+│     goes on in the daemon, so doctor reports it as cloning in the background.  │
+│     A team context has the same 60s in the daemon, so doctor reports failure.  │
 │  🔶 CRITICAL PATH: If fails, CLI falls back to direct git clone               │
 │     (see cmd/ox/doctor_git_repos.go:cloneViaDaemon)                            │
 │                                                                                 │
@@ -358,6 +362,7 @@ Each workspace (repo) gets its own daemon instance:
 │   Network-bound       │  60s    │  team_sync, checkout/clone                    │
 │   ════════════════════════════════════════════════════════════════════          │
 │   Rationale: Clone operations are network-bound. Progress shown.                │
+│   Both are idle timeouts: each progress update restarts the 60s.                │
 │                                                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -451,6 +456,7 @@ Each workspace (repo) gets its own daemon instance:
 ```json
 {"progress":{"stage":"connecting","percent":10,"message":"Connecting..."}}
 {"progress":{"stage":"cloning","percent":50,"message":"Cloning repo..."}}
+{"progress":{"stage":"downloading","message":"Downloading: 412.3 MB received, 2m30s elapsed"}}
 {"progress":{"stage":"verifying","percent":90,"message":"Verifying..."}}
 ```
 

@@ -28,6 +28,20 @@ func (s *SyncScheduler) backgroundCloneContext() context.Context {
 	return context.Background()
 }
 
+// clonesInFlight reports whether a clone is running: a checkout in progress
+// (background or over IPC), or a background clone not yet in Checkout.
+func (s *SyncScheduler) clonesInFlight() bool {
+	if s.checkouts.Load() > 0 {
+		return true
+	}
+	running := false
+	s.cloneInFlight.Range(func(_, _ any) bool {
+		running = true
+		return false
+	})
+	return running
+}
+
 // isClonePermanentError returns true if the error message indicates a failure
 // that won't resolve on its own (bad credentials, missing permissions, bad URL).
 // Transient errors (network timeout, server 503) return false.
@@ -88,6 +102,12 @@ func (s *SyncScheduler) cloneInBackground(ctx context.Context, cloneURL, repoPat
 	}, nil) // no progress writer for background clones
 
 	if err != nil {
+		// the daemon stopped mid-download: not a clone failure, so no error
+		// and no backoff; the next start clones again
+		if errors.Is(err, errCloneInterrupted) {
+			s.logger.Info("clone stopped by daemon shutdown, will retry on next start", "type", repoType, "path", repoPath)
+			return
+		}
 		s.refreshAfterAuthFailure(ctx, err)
 		s.logger.Error("background clone failed", "type", repoType, "path", repoPath, "error", err)
 

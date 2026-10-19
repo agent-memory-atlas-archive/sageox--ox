@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -18,6 +20,7 @@ import (
 	"github.com/sageox/ox/internal/endpoint"
 	"github.com/sageox/ox/internal/errkind"
 	"github.com/sageox/ox/internal/gitserver"
+	"github.com/sageox/ox/internal/gitutil"
 	"github.com/sageox/ox/internal/ledger"
 	"github.com/sageox/ox/internal/manifest"
 	"github.com/sageox/ox/internal/paths"
@@ -163,7 +166,9 @@ func fixBrokenSymlink(localCfg *config.LocalConfig, issue repoPathIssue) bool {
 		endpoint: issue.endpoint,
 		issue:    "missing",
 	}); err != nil {
-		fmt.Printf("  Clone failed: %v\n", err)
+		if !errors.Is(err, daemon.ErrCheckoutInProgress) {
+			fmt.Printf("  Clone failed: %v\n", err)
+		}
 		return false
 	}
 
@@ -208,7 +213,7 @@ func fixRepoPathIssues(gitRoot string, localCfg *config.LocalConfig, issues []re
 		}
 	}
 
-	var fixed, skipped int
+	var fixed, skipped, cloning int
 
 	for _, issue := range issues {
 		var repoLabel string
@@ -287,6 +292,11 @@ func fixRepoPathIssues(gitRoot string, localCfg *config.LocalConfig, issues []re
 
 			// attempt clone
 			if err := cloneRepoForFix(issue); err != nil {
+				if errors.Is(err, daemon.ErrCheckoutInProgress) {
+					cloning++
+					fmt.Println()
+					continue
+				}
 				fmt.Printf("  Clone failed: %v\n", err)
 				skipped++
 				continue
@@ -321,9 +331,12 @@ func fixRepoPathIssues(gitRoot string, localCfg *config.LocalConfig, issues []re
 	if fixed == len(issues) {
 		return PassedCheck("git repo paths", fmt.Sprintf("fixed %d repo(s)", fixed))
 	}
-	if fixed > 0 {
+	if cloning > 0 && fixed+cloning == len(issues) {
+		return stillCloningCheck(cloning)
+	}
+	if fixed > 0 || cloning > 0 {
 		return WarningCheck("git repo paths",
-			fmt.Sprintf("fixed %d, skipped %d", fixed, skipped),
+			fmt.Sprintf("fixed %d, skipped %d", fixed, skipped)+stillCloningSuffix(cloning),
 			"Run `ox doctor --fix` again to fix remaining issues")
 	}
 	return WarningCheck("git repo paths",
@@ -377,7 +390,7 @@ func fixMissingRepos(gitRoot string, localCfg *config.LocalConfig) checkResult {
 		}
 	}
 
-	var fixed, skipped, total int
+	var fixed, skipped, cloning, total int
 
 	// clone ledger from repo detail API (GetRepos doesn't return ledgers)
 	if repoDetail != nil && repoDetail.Ledger != nil && repoDetail.Ledger.Status == "ready" && repoDetail.Ledger.RepoURL != "" {
@@ -399,7 +412,9 @@ func fixMissingRepos(gitRoot string, localCfg *config.LocalConfig) checkResult {
 		if err := os.MkdirAll(filepath.Dir(ledgerPath), 0755); err != nil {
 			fmt.Printf("    Error creating directory: %v\n", err)
 			skipped++
-		} else if err := cloneViaDaemon(repoDetail.Ledger.RepoURL, ledgerPath, "ledger", projectEndpoint); err != nil {
+		} else if err := cloneViaDaemon(repoDetail.Ledger.RepoURL, ledgerPath, "ledger", projectEndpoint); errors.Is(err, daemon.ErrCheckoutInProgress) {
+			cloning++
+		} else if err != nil {
 			fmt.Printf("    Clone failed: %v\n", err)
 			skipped++
 		} else {
@@ -495,9 +510,12 @@ func fixMissingRepos(gitRoot string, localCfg *config.LocalConfig) checkResult {
 	if fixed == total {
 		return PassedCheck("git repo paths", fmt.Sprintf("cloned %d repo(s)", fixed))
 	}
-	if fixed > 0 {
+	if cloning > 0 && fixed+cloning == total {
+		return stillCloningCheck(cloning)
+	}
+	if fixed > 0 || cloning > 0 {
 		return WarningCheck("git repo paths",
-			fmt.Sprintf("cloned %d, failed %d", fixed, skipped),
+			fmt.Sprintf("cloned %d, failed %d", fixed, skipped)+stillCloningSuffix(cloning),
 			"Run `ox doctor --fix` again to retry failed repos")
 	}
 	return FailedCheck("git repo paths",
@@ -536,6 +554,57 @@ func extractTeamIDFromRepoName(name string) string {
 	return ""
 }
 
+// doctorCheckoutIdle is how long doctor waits on a daemon clone that reports
+// no progress before leaving it to finish in the background. A downloading
+// Ledger clone reports every few seconds, so it is only reached when the
+// daemon is busy elsewhere first (e.g. waiting out its own background clone
+// of the same repo) or is too old to report downloads. Var so tests can
+// shrink it.
+var doctorCheckoutIdle = 60 * time.Second
+
+// checkoutProgressEvery is how often doctor prints a running download's
+// progress. The daemon reports every few seconds, for as long as a Ledger
+// downloads. Var so tests can shrink it.
+var checkoutProgressEvery = 30 * time.Second
+
+// checkoutProgressPrinter prints a daemon clone's progress messages, each
+// once, and a running download's at most every checkoutProgressEvery.
+type checkoutProgressPrinter struct {
+	last         string
+	lastDownload time.Time
+}
+
+func (p *checkoutProgressPrinter) print(stage string, _ *int, message string) {
+	if message == "" || message == p.last {
+		return
+	}
+	if stage == daemon.CheckoutStageDownloading {
+		if time.Since(p.lastDownload) < checkoutProgressEvery {
+			return
+		}
+		p.lastDownload = time.Now()
+	}
+	p.last = message
+	fmt.Printf("    %s\n", message)
+}
+
+// stillCloningCheck is the result when every repo doctor could not finish is
+// still being cloned by the daemon: nothing failed, the clones land on their own.
+func stillCloningCheck(cloning int) checkResult {
+	return WarningCheck("git repo paths",
+		fmt.Sprintf("%d repo(s) still cloning in the background", cloning),
+		"The ox daemon is still cloning. Run `ox status` to check on it; `ox doctor` passes once it lands.")
+}
+
+// stillCloningSuffix extends a mixed outcome's summary with the repos the
+// daemon is still cloning.
+func stillCloningSuffix(cloning int) string {
+	if cloning == 0 {
+		return ""
+	}
+	return fmt.Sprintf(", still cloning %d", cloning)
+}
+
 // cloneViaDaemon clones a repo using the daemon's checkout capability.
 // Clone operations go through daemon for centralized credential handling.
 //
@@ -557,19 +626,25 @@ func extractTeamIDFromRepoName(name string) string {
 func cloneViaDaemon(cloneURL, targetPath, repoType, endpointURL string) error {
 	// Try daemon first (preferred path - centralized credential handling)
 	if daemon.IsRunning() {
-		client := daemon.NewClientForCurrentRepoWithTimeout(60 * time.Second)
+		client := daemon.NewClientForCurrentRepoWithTimeout(doctorCheckoutIdle)
 		payload := daemon.CheckoutPayload{
 			RepoPath: targetPath,
 			CloneURL: cloneURL,
 			RepoType: repoType,
 		}
 
-		result, err := client.Checkout(payload, func(stage string, percent *int, message string) {
-			// progress updates - could be shown to user if needed
-			if message != "" {
-				fmt.Printf("    %s\n", message)
+		progress := &checkoutProgressPrinter{}
+		result, err := client.Checkout(payload, progress.print)
+		if errors.Is(err, daemon.ErrCheckoutInProgress) {
+			if repoType == "team-context" {
+				// its clone has the same 60s budget in the daemon, so a quiet
+				// window this long means it failed or is about to
+				return fmt.Errorf("team context clone did not finish within %s", doctorCheckoutIdle)
 			}
-		})
+			// the daemon keeps cloning after doctor stops waiting
+			fmt.Println("    Still cloning in the ox daemon; it continues in the background.")
+			return err
+		}
 		if err != nil {
 			return err
 		}
@@ -591,7 +666,8 @@ func cloneViaDaemon(cloneURL, targetPath, repoType, endpointURL string) error {
 	// ─────────────────────────────────────────────────────────────────────────
 	fmt.Println("    Note: Daemon not running, using direct clone")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	// the team-context budget; a Ledger clone brings its own (directCloneLedger)
+	ctx, cancel := context.WithTimeout(context.Background(), directTeamContextCloneTimeout)
 	defer cancel()
 
 	if repoType == "team-context" {
@@ -614,14 +690,110 @@ func cloneViaDaemon(cloneURL, targetPath, repoType, endpointURL string) error {
 		}
 		gitserver.ValidateTeamContextClone(targetPath, result.ManifestConfig)
 	} else {
-		// ledger: full clone
-		if err := gitserver.CloneFromURLWithEndpoint(ctx, cloneURL, targetPath, endpointURL, nil); err != nil {
+		// ledger: full clone, on a backstop and curl's stall check, not ctx
+		if err := directCloneLedger(cloneURL, targetPath, endpointURL); err != nil {
 			return fmt.Errorf("direct clone failed: %w", err)
 		}
 	}
 
 	fmt.Println("    Cloned successfully (direct).")
 	return nil
+}
+
+// Budgets for a direct clone, used when the daemon is not running. Vars so
+// tests can shrink them.
+var (
+	// directTeamContextCloneTimeout bounds the team-context two-phase clone,
+	// a partial clone whose blobs arrive on demand, so a fixed budget fits it.
+	directTeamContextCloneTimeout = 60 * time.Second
+
+	// directLedgerCloneTimeout is only a backstop, as it is in the daemon
+	// (ledgerCloneTimeout in internal/daemon/sync_clone_budget.go). A Ledger
+	// clone downloads the whole history, so how long it takes is the
+	// coworker's link speed. The fixed 60s this clone used to share killed
+	// every Ledger that needed longer (GH #994). A transfer that stops making
+	// progress is still aborted within ~20s, by curl's stall check
+	// (gitutil.GitHTTPTimeoutFlags).
+	directLedgerCloneTimeout = time.Hour
+
+	// directCloneSampleEvery is how often a direct Ledger clone's size is
+	// sampled. Doctor prints it every checkoutProgressEvery.
+	directCloneSampleEvery = 2 * time.Second
+)
+
+// curlLowSpeedAbort is how curl words its stall abort ("Operation too slow.
+// Less than 1000 bytes/sec transferred the last 15 seconds"). curl's messages
+// are not translated, so it holds in any locale.
+const curlLowSpeedAbort = "Operation too slow"
+
+// directCloneLedger clones a Ledger without the daemon, on the budget the
+// daemon gives one: a long backstop, with curl's stall check ending a dead
+// link. A full Ledger clone can run for many minutes, so doctor prints how
+// much has arrived while it does.
+func directCloneLedger(cloneURL, targetPath, endpointURL string) error {
+	budget := directLedgerCloneTimeout
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+
+	var output bytes.Buffer
+	stopProgress := watchDirectClone(targetPath, time.Now())
+	err := gitserver.CloneFromURLWithEndpoint(ctx, cloneURL, targetPath, endpointURL,
+		&gitserver.CheckoutOptions{Quiet: true, Output: &output})
+	received := stopProgress()
+	if err != nil {
+		return directLedgerCloneError(ctx, budget, received, output.String(), err)
+	}
+	return nil
+}
+
+// watchDirectClone samples how large the clone at dir has grown while git
+// runs and prints it the way a daemon clone's progress is printed. git deletes
+// a failed clone's directory as it exits, so the size has to be sampled while
+// git runs. stop ends sampling and returns the largest size seen.
+func watchDirectClone(dir string, start time.Time) (stop func() int64) {
+	var largest int64
+	done := make(chan struct{})
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		tick := time.NewTicker(directCloneSampleEvery)
+		defer tick.Stop()
+		progress := &checkoutProgressPrinter{}
+		for {
+			select {
+			case <-done:
+				return
+			case now := <-tick.C:
+				if largest = max(largest, dirSize(dir)); largest == 0 {
+					continue // still negotiating; nothing has arrived
+				}
+				progress.print(daemon.CheckoutStageDownloading, nil, fmt.Sprintf("Downloading: %s received, %s elapsed",
+					humanSize(largest), now.Sub(start).Round(time.Second)))
+			}
+		}
+	}()
+	return func() int64 {
+		close(done)
+		<-finished
+		return largest
+	}
+}
+
+// directLedgerCloneError says why a direct Ledger clone failed. When the
+// backstop or curl's stall check ended it, git's own output ("fetch-pack:
+// unexpected disconnect while reading sideband packet", "early EOF")
+// describes the abort, not the server, so it is replaced with what happened.
+func directLedgerCloneError(ctx context.Context, budget time.Duration, received int64, gitOutput string, err error) error {
+	switch {
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+		return fmt.Errorf("clone ledger timed out after %s (%s received)", budget, humanSize(received))
+	case strings.Contains(gitOutput, curlLowSpeedAbort):
+		return fmt.Errorf("clone ledger stalled: the download stopped making progress (%s received)", humanSize(received))
+	}
+	if out := gitutil.SanitizeOutput(gitOutput); out != "" {
+		return fmt.Errorf("git clone failed: %s", out)
+	}
+	return err
 }
 
 // cloneRepoForFix clones a repo to fix a path issue.

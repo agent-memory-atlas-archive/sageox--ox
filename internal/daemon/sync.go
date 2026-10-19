@@ -178,6 +178,7 @@ type SyncScheduler struct {
 	cloneSem      chan struct{}  // semaphore limiting concurrent clones
 	cloneInFlight sync.Map       // tracks workspace IDs with clone in progress (dedup)
 	cloneWg       sync.WaitGroup // tracks in-flight background clone goroutines
+	checkouts     atomic.Int32   // Checkout calls running, background or over IPC
 
 	// cloneMu guards cloneWg.Add against a concurrent Wait during shutdown.
 	// Without this, a pullChanges goroutine still running after ctx cancel
@@ -819,7 +820,9 @@ func (s *SyncScheduler) waitClones(timeout time.Duration) {
 // Start runs the scheduler until cancellation, then joins the delayed startup
 // pull before returning. Tracked background clones receive a bounded drain period.
 func (s *SyncScheduler) Start(ctx context.Context) {
-	s.ctx = ctx
+	if s.ctx == nil { // the daemon binds it before the IPC server starts
+		s.ctx = ctx
+	}
 
 	// load initial workspace state from config
 	if err := s.workspaceRegistry.LoadFromConfig(); err != nil {
@@ -2397,6 +2400,12 @@ func isValidRepoPath(path string) bool {
 // │ - Workspace registry cache invalidation                                     │
 // └─────────────────────────────────────────────────────────────────────────────┘
 func (s *SyncScheduler) Checkout(payload CheckoutPayload, progress *ProgressWriter) (*CheckoutResult, error) {
+	// a running checkout is pending work for the inactivity exit (clonesInFlight):
+	// IPC traffic counts as activity only when a message arrives, not while a
+	// long clone it asked for is still downloading
+	s.checkouts.Add(1)
+	defer s.checkouts.Add(-1)
+
 	// validate path before any operations to prevent path traversal attacks
 	if !isValidRepoPath(payload.RepoPath) {
 		return nil, ErrInvalidRepoPath
@@ -2551,7 +2560,15 @@ func (s *SyncScheduler) Checkout(payload CheckoutPayload, progress *ProgressWrit
 		// misclassifies as benign lock contention (matches
 		// context.DeadlineExceeded) — masking a real clone failure as a
 		// harmless retry-next-cycle.
-		cloneCtx, cloneCancel := context.WithTimeout(context.Background(), 60*time.Second)
+		//
+		// The budget depends on what is being cloned: a team context is a
+		// small partial clone, a Ledger is its whole history. See
+		// ledgerCloneTimeout.
+		cloneBudget := teamContextCloneTimeout
+		if payload.RepoType != "team-context" {
+			cloneBudget = ledgerCloneTimeout
+		}
+		cloneCtx, cloneCancel := s.cloneContext(cloneBudget)
 		defer cloneCancel()
 
 		// send progress: connecting
@@ -2666,15 +2683,15 @@ func (s *SyncScheduler) Checkout(payload CheckoutPayload, progress *ProgressWrit
 			_ = os.MkdirAll(parentDir, 0755)
 			cloneCmd.Dir = parentDir
 		}
-		if output, err := cloneCmd.CombinedOutput(); err != nil {
-			sanitizedOutput := gitutil.SanitizeOutput(string(output))
-			s.logger.Error("checkout: clone failed", "error", err, "output", sanitizedOutput)
-			s.recordError(payload.RepoType, fmt.Sprintf("clone %s failed: %v", payload.RepoType, err))
-			if sanitizedOutput != "" {
-				return fmt.Errorf("git clone failed: %s", sanitizedOutput)
-			}
-			return fmt.Errorf("git clone failed: %w", err)
+		cloneStart := time.Now()
+		stopProgress := s.watchCloneProgress(tempPath, cloneStart, progress)
+		output, err := cloneCmd.CombinedOutput()
+		received := stopProgress()
+		if err != nil {
+			return s.ledgerCloneError(cloneCtx, payload.RepoType, cloneBudget, time.Since(cloneStart), received, output, err)
 		}
+		s.logger.Info("checkout: clone downloaded", "path", payload.RepoPath,
+			"elapsed", time.Since(cloneStart).Round(time.Millisecond), "size_bytes", dirSize(tempPath))
 
 		// verify the temp clone is actually complete before it ever becomes
 		// visible at payload.RepoPath — an early-EOF clone can exit non-zero
