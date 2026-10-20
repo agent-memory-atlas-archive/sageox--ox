@@ -385,13 +385,8 @@ func TestSessionUpload_ScansContentBeforeLFS(t *testing.T) {
 					uploadedRaw, err = os.ReadFile(filepath.Join(sessionDir, ledgerFileRaw))
 					require.NoError(t, err)
 					refs := map[string]lfs.FileRef{ledgerFileRaw: lfs.NewFileRef(uploadedRaw)}
-					if tc.allowSecrets {
-						require.Contains(t, string(uploadedRaw), canary, "the existing explicit override remains effective")
-						refs[ledgerFileSummaryMD] = lfs.NewFileRef(summary)
-					} else {
-						require.NotContains(t, string(uploadedRaw), canary, "LFS must never receive the detected credential")
-						require.NoFileExists(t, filepath.Join(sessionDir, ledgerFileSummaryMD), "unredactable content must be quarantined before upload")
-					}
+					require.NotContains(t, string(uploadedRaw), canary, "LFS must never receive the detected credential, including with a legacy override")
+					require.NoFileExists(t, filepath.Join(sessionDir, ledgerFileSummaryMD), "unredactable content must be quarantined before upload")
 					return refs, nil
 				}
 				effects.commitInitial = commitAndPushLedger
@@ -413,17 +408,13 @@ func TestSessionUpload_ScansContentBeforeLFS(t *testing.T) {
 				assert.Equal(t, meta.Files[ledgerFileRaw].OID, oid)
 				assert.Equal(t, int64(len(uploadedRaw)), size)
 				assert.Empty(t, runGit(t, ledgerPath, "status", "--porcelain", "--", remoteDir+"/raw.jsonl"))
-				if tc.allowSecrets {
-					assert.Empty(t, meta.Redactions)
-				} else {
-					require.NotEmpty(t, meta.Redactions, "the audit must survive metadata updates after upload")
-					assert.Empty(t, runGit(t, barePath, "ls-tree", "--name-only", "HEAD", remoteDir+"/summary.md"))
-					quarantine := filepath.Join(ledgerPath, ".sageox", "cache", "quarantine", fixture.sessionName, ledgerFileSummaryMD)
-					preserved, err := os.ReadFile(quarantine)
-					require.NoError(t, err)
-					assert.Equal(t, summary, preserved, "quarantine must preserve the original for recovery")
-					require.FileExists(t, filepath.Join(ledgerPath, ".sageox", "cache", "redaction-debt", fixture.sessionName+".json"))
-				}
+				require.NotEmpty(t, meta.Redactions, "the audit must survive metadata updates after upload")
+				assert.Empty(t, runGit(t, barePath, "ls-tree", "--name-only", "HEAD", remoteDir+"/summary.md"))
+				quarantine := filepath.Join(ledgerPath, ".sageox", "cache", "quarantine", fixture.sessionName, ledgerFileSummaryMD)
+				preserved, err := os.ReadFile(quarantine)
+				require.NoError(t, err)
+				assert.Equal(t, summary, preserved, "quarantine must preserve the original for recovery")
+				require.FileExists(t, filepath.Join(ledgerPath, ".sageox", "cache", "redaction-debt", fixture.sessionName+".json"))
 			})
 		}
 	}
@@ -432,7 +423,7 @@ func TestSessionUpload_ScansContentBeforeLFS(t *testing.T) {
 // The routine gate checks lines above bufio.Scanner's default 64 KiB limit.
 // The 4 MiB former-buffer regression is exercised in the slow tier because
 // race-instrumented secret regexes on multi-megabyte lines exceed the fast tier's budget.
-func TestSessionUpload_ScansLongLinesUnderSizeCap(t *testing.T) {
+func TestSessionUpload_ScansLongLines(t *testing.T) {
 	testSessionUploadScansLongLines(t, 128*1024)
 }
 
@@ -444,7 +435,7 @@ func testSessionUploadScansLongLines(t *testing.T, lineLength int) {
 			t.Setenv("OX_ALLOW_SECRETS", "")
 			const canary = "AKIAIOSFODNN7EXAMPLE"
 			longLine := strings.Repeat("x", lineLength) + " " + canary
-			require.Less(t, len(longLine), prePushScannerSizeCap, "the line must stay under the file cap so the file is scanned")
+			require.Less(t, len(longLine), rawJSONLMaxLineBytes, "the line must fit the scanner line bound so the file is scanned")
 			oversized := []byte(strings.ReplaceAll(string(fixture.rawContent), "preserve me", longLine))
 			require.NoError(t, os.WriteFile(fixture.result.RawPath, oversized, 0o600))
 			var calls []string
