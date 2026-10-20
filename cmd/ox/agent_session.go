@@ -1278,7 +1278,7 @@ func processAgentSession(projectRoot string, state *session.RecordingState) (*ag
 		Summary: localSummary,
 	}
 
-	result.Summary = localSummary
+	result.Summary = publishableSummary(localSummary)
 
 	// use the session name from recording state (generated at start time)
 	// to ensure cache and ledger directories always match
@@ -1464,7 +1464,9 @@ func processAgentSession(projectRoot string, state *session.RecordingState) (*ag
 		}
 	} else {
 		uploadStart := time.Now()
-		uploadErr := uploadSessionToLedger(projectRoot, result, state, ledgerPath, sessionName)
+		uploadErr := uploadSessionBeforeHostEnds(sessionName, daemonOutlivesSession(), func() error {
+			return uploadSessionToLedger(projectRoot, result, state, ledgerPath, sessionName)
+		}, time.Sleep)
 		result.UploadMs = time.Since(uploadStart).Milliseconds()
 		if uploadErr != nil {
 			if errors.Is(uploadErr, api.ErrReadOnly) {
@@ -1516,6 +1518,21 @@ func finalizeModeForSessionStop(userPrefersAsync bool) session.FinalizeDispatchM
 // (sageox/ox#1314).
 func daemonOutlivesSession() bool {
 	return !daemon.IsDaemonDisabled() && !runtime.Caps().HostEndsWithAgent
+}
+
+// publishableSummary drops a local summary that is only a stats line. With no
+// user message to name a topic, session.LocalSummary returns just "0 user
+// messages, 1 assistant responses. ...", which meta.json's writer rejects as
+// a leaked failure stub (ox-qqka). That failed every upload of an Amp orb
+// session, whose recording starts after the thread's first prompt
+// (sageox/ox#1318, #1425). The stop result carries the normalized value, so
+// the stop's JSON and the team-memory observation don't repeat the stub
+// either. An empty summary is legal, and the summarizer fills it later.
+func publishableSummary(summary string) string {
+	if lfs.IsLeakySummaryString(summary) {
+		return ""
+	}
+	return summary
 }
 
 // uploadSessionToLedger uploads cached blobs to LFS, then commits and pushes

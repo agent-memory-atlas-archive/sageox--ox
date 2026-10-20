@@ -41,7 +41,7 @@ require (
 	github.com/oklog/ulid/v2 v2.1.1
 	github.com/pelletier/go-toml/v2 v2.4.3
 	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c
-	github.com/sageox/agentx v0.1.14
+	github.com/sageox/agentx v0.1.15
 	github.com/sageox/frictionax v0.1.3
 	github.com/sageox/ox/pkg/planreview v0.4.0
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2

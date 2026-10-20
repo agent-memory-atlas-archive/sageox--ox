@@ -330,7 +330,7 @@ func finalizeIncrementalSession(projectRoot string, state *session.RecordingStat
 	summaryResp := &session.SummarizeResponse{
 		Summary: localSummary,
 	}
-	result.Summary = localSummary
+	result.Summary = publishableSummary(localSummary)
 
 	ledgerPath, ledgerErr := resolveLedgerPath()
 	if ledgerErr == nil {
@@ -391,7 +391,9 @@ func finalizeIncrementalSession(projectRoot string, state *session.RecordingStat
 		result.UploadWarning = "Session saved locally but ledger upload skipped (no ledger). Run 'ox doctor' to retry."
 	} else {
 		uploadStart := time.Now()
-		uploadErr := uploadSessionToLedger(projectRoot, result, state, ledgerPath, sessionName)
+		uploadErr := uploadSessionBeforeHostEnds(sessionName, daemonOutlivesSession(), func() error {
+			return uploadSessionToLedger(projectRoot, result, state, ledgerPath, sessionName)
+		}, time.Sleep)
 		result.UploadMs = time.Since(uploadStart).Milliseconds()
 		if uploadErr != nil {
 			if errors.Is(uploadErr, api.ErrReadOnly) {
