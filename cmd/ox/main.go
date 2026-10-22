@@ -139,8 +139,7 @@ func main() {
 		_ = godotenv.Load(".env")
 	}
 
-	args := applyCatalogTokenRewrites(os.Args[1:], loadFlagAliases(defaultCatalogJSON))
-	exitCode := executeWithSignalContext(args)
+	exitCode := executeWithSignalContext(os.Args[1:])
 	// Flush the result before deciding success, while stderr can still report
 	// a failed destination. Preserve an existing command failure's exit code.
 	os.Stdout.Close()
@@ -226,6 +225,13 @@ func executeWithFrictionRecovery(ctx context.Context, args []string, attempt int
 		initFeatureFlags(rootCmd)
 		syncFeatureGatedCommands(rootCmd)
 	}
+	// the first attempt gets the pre-cobra rewrites: a one-word command line or
+	// a subcommand typed as a flag is fixed before flag aliases look at the
+	// argv. Both run after the feature-gate sync so an enabled gated command
+	// resolves like any other.
+	if attempt == 0 {
+		args = applyCatalogTokenRewrites(normalizeInvocation(args), loadFlagAliases(defaultCatalogJSON))
+	}
 	rootCmd.SetArgs(args)
 	preRunReached = false
 	start := time.Now()
@@ -305,11 +311,20 @@ func executeWithFrictionRecovery(ctx context.Context, args []string, attempt int
 		return 1
 	}
 
-	result := handleFriction(frictionEngine, args, err)
+	// plan the correction without running anything: catalog match on the whole
+	// input, then on its leading words, then a plausibility-guarded fuzzy guess.
+	// Auto-execution is already downgraded to a suggestion here when the
+	// corrected argv would not parse.
+	plan := planCorrection(args, err)
+	result := plan.Result
 	if result == nil {
 		printError(err)
 		return 1
 	}
+
+	// record what we offered next to what was typed, so the catalog can learn
+	// which corrections agents actually needed
+	attachSuggestion(result)
 
 	// send friction event to daemon for analytics (fire-and-forget)
 	sendFrictionEvent(result.Event)
@@ -330,10 +345,12 @@ func executeWithFrictionRecovery(ctx context.Context, args []string, attempt int
 	}
 
 	// determine output mode
-	jsonMode := cfg != nil && cfg.JSON
+	// cfg is nil when cobra rejected the invocation before the command's setup
+	// ran, so a --json typed on the failing command line is read from args
+	jsonMode := (cfg != nil && cfg.JSON) || argsRequestJSON(args)
 
 	// emit correction/suggestion for learning
-	result.Emit(jsonMode || agentx.IsAgentContext())
+	emitCorrection(plan, jsonMode || agentx.IsAgentContext())
 
 	// auto-execute if high confidence and within retry limit
 	if result.AutoExecute && attempt < maxFrictionRetries {
