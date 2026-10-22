@@ -1470,6 +1470,11 @@ func (s *SyncScheduler) doPull(ctx context.Context, progress *ProgressWriter, fo
 		}
 
 		s.clearDisprovedBySkip("ledger", result.SkipReason)
+		if s.issues != nil {
+			// a skipped pull still found a cloned ledger; a clone_failed issue
+			// from before an out-of-band repair (`ox doctor --fix`) is stale
+			s.issues.ClearIssue(IssueTypeCloneFailed, "ledger")
+		}
 
 		// remote-unchanged or recently-fetched: update sync timestamps
 		if result.SkipReason == "remote unchanged" || result.SkipReason == "recently fetched" {
@@ -2457,6 +2462,15 @@ func (s *SyncScheduler) Checkout(payload CheckoutPayload, progress *ProgressWrit
 	// `ox doctor --fix` runs during one Ledger download used to fill every
 	// slot, and team-context clones failed with ErrCloneSemaphoreTimeout.
 	acquired, err := gitutil.TryWithPreCloneLock(payload.RepoPath, func() error {
+		// A symlinked target is a coworker's relocation. Moving it aside or
+		// renaming a clone over it could replace the link (and the data behind
+		// it), so refuse before any rename and surface it through doctor.
+		// A symlink to a complete checkout never reaches here (AlreadyExists).
+		if symErr := gitserver.RejectSymlinkTarget(payload.RepoPath); symErr != nil && !checkoutComplete(payload) {
+			s.logger.Error("checkout: refusing symlinked clone target", "path", payload.RepoPath, "error", symErr)
+			s.recordError(filepath.Base(payload.RepoPath), fmt.Sprintf("clone %s failed: %v", payload.RepoType, symErr))
+			return symErr
+		}
 		// Re-verify directory state now that we hold the lock — a peer
 		// that held it may have finished cloning since the check above.
 		if info, statErr := os.Stat(payload.RepoPath); statErr == nil && info.IsDir() {
@@ -2590,7 +2604,23 @@ func (s *SyncScheduler) Checkout(payload CheckoutPayload, progress *ProgressWrit
 			if progress != nil {
 				_ = progress.WriteStage("cloning", "Fetching repository structure...")
 			}
-			mCfg, err := s.twoPhaseClone(cloneCtx, cloneURL, payload.RepoPath, progress)
+			// Clone into a hidden temp sibling and move it into place, like the
+			// ledger: the clone refuses a non-empty target, and a local-only
+			// skeleton (a whisper cache created before the first clone) is
+			// adopted by MoveCloneIntoPlace instead of being set aside in the
+			// teams directory where enumerators would list it as a team.
+			sweepStaleTeamCloneTemps(payload.RepoPath)
+			teamTemp := teamCloneTempPath(payload.RepoPath)
+			defer func() { _ = os.RemoveAll(teamTemp) }() // no-op once renamed away
+			if markErr := markTeamCloneStaging(teamTemp); markErr != nil {
+				// unmarked staging is never swept; the clone itself is unaffected
+				s.logger.Warn("checkout: could not mark team clone staging", "path", teamTemp, "error", markErr)
+			}
+			defer unmarkTeamCloneStaging(teamTemp)
+			mCfg, err := s.twoPhaseClone(cloneCtx, cloneURL, teamTemp, progress)
+			if err == nil {
+				err = gitserver.MoveCloneIntoPlace(teamTemp, payload.RepoPath)
+			}
 			if err != nil {
 				s.logger.Error("checkout: two-phase clone failed", "error", err)
 				// Keyed by pullTeamContext's repoName, the key clearErrors is
