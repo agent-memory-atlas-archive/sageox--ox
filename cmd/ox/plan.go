@@ -85,12 +85,9 @@ Output is JSON by default (the AI-coworker/plumbing path). Use --text for a huma
 			return err
 		}
 		// An authored HTML plan enriches via its DERIVED markdown — the
-		// detectors are section/file-keyed and must never parse raw HTML.
-		if plan.LooksLikeHTML(in.Path, in.Raw) {
-			p := plan.Parse(plan.ExtractMarkdown([]byte(in.Raw)))
-			p.Path = in.Path
-			in = p
-		}
+		// detectors are section/file-keyed and must never parse raw HTML. The
+		// page itself is kept so a save stores it as the plan of record.
+		in, authored := splitAuthoredHTML(in)
 
 		// No plan found anywhere: a clear message beats enriching empty input.
 		if in.Topic == "" && strings.TrimSpace(in.Raw) == "" {
@@ -109,8 +106,8 @@ Output is JSON by default (the AI-coworker/plumbing path). Use --text for a huma
 			// With --persist (the ExitPlanMode hook) also save + commit a draft;
 			// the save writes only to logs/ledger so stdout JSON stays clean.
 			saved := ""
-			if persist && gitRoot != "" && config.PlanSave(gitRoot) {
-				saved = savePlanWithProvenance(gitRoot, in, result, nil)
+			if persist {
+				saved, _ = maybeSavePlan(gitRoot, in, result, authored)
 			}
 			// Nothing persisted this plan, so the agent is about to implement
 			// from a document no teammate will ever see. Stamp it for the
@@ -125,14 +122,14 @@ Output is JSON by default (the AI-coworker/plumbing path). Use --text for a huma
 		}
 
 		// --text: human porcelain — auto-save (if enabled), metric, summary.
-		savedDir := maybeSavePlan(gitRoot, in, result)
+		savedDir, pageSaved := maybeSavePlan(gitRoot, in, result, authored)
 		if savedDir == "" {
 			if err := armUnsavedPlanStamp(gitRoot, envAgentID(), in, result); err != nil {
 				slog.Debug("plan: could not arm unsaved-plan stamp", "error", err)
 			}
 		}
 		plan.RecordPlanGenerated(result, savedDir != "")
-		return writePlanHuman(cmd, result, savedDir)
+		return writePlanHuman(cmd, result, savedDir, pageSaved)
 	},
 }
 
@@ -318,26 +315,50 @@ mark must be self-contained (no live remote avatar). Advisory by default; pass
 }
 
 // maybeSavePlan captures the enriched plan to the ledger when auto-save is
-// enabled and a ledger is configured. html is nil for now — the porcelain path
+// enabled and a ledger is configured. authored is the page when the plan was
+// an authored HTML page (see splitAuthoredHTML), else nil — the porcelain path
 // never renders HTML just to save it (that's a skill-side, opt-in action).
 // Returns the saved directory, or "" when nothing was saved (disabled, no
 // ledger, or a write error — capture is best-effort and never aborts the
-// command).
-func maybeSavePlan(gitRoot string, in plan.Input, result plan.Result) string {
+// command). The directory is also returned when a large authored page failed
+// its LFS upload: the files are on disk with a retry marker but nothing was
+// committed. pageSaved is true only when an authored page was saved and that
+// upload did not fail, so callers never claim the page is the plan of record
+// when it is not.
+func maybeSavePlan(gitRoot string, in plan.Input, result plan.Result, authored []byte) (dir string, pageSaved bool) {
 	if gitRoot == "" || !config.PlanSave(gitRoot) {
-		return ""
+		return "", false
 	}
-	return savePlanWithProvenance(gitRoot, in, result, nil)
+	var report planSaveReport
+	dir = saveEnrichedPlan(gitRoot, in, result, authored, withReport(&report))
+	pageSaved = dir != "" && authored != nil && report.Share.Reason != planHTMLUploadFailedReason
+	return dir, pageSaved
 }
 
-// savePlanWithProvenance is the shared capture path: it stamps the plan with
-// provenance (session/agent/repo) + deterministic collaboration signals, writes
-// it to the ledger (read-merge preserving lifecycle), records the reverse link
-// on the live recording, and durably commits + pushes the plan dir. Returns the
-// saved directory, or "" on any failure (capture is best-effort and never
-// aborts the command the agent is waiting on).
-func savePlanWithProvenance(gitRoot string, in plan.Input, result plan.Result, html []byte) string {
-	return savePlanArtifacts(gitRoot, in, result, html, "")
+// splitAuthoredHTML returns in unchanged and a nil page for a markdown plan.
+// For an authored HTML page it returns the input parsed from the page's
+// DERIVED markdown, which is what the detectors read, plus the page bytes,
+// which are the plan of record. `ox plan save --file`, lint and render make
+// the same split inline.
+func splitAuthoredHTML(in plan.Input) (plan.Input, []byte) {
+	if !plan.LooksLikeHTML(in.Path, in.Raw) {
+		return in, nil
+	}
+	page := []byte(in.Raw)
+	derived := plan.Parse(plan.ExtractMarkdown(page))
+	derived.Path = in.Path
+	return derived, page
+}
+
+// saveEnrichedPlan saves a plan the way `ox plan save --file` would: an
+// authored page goes in HTML-primary (plan.html verbatim, plan.md derived from
+// it), anything else markdown-primary. Passing a nil page for an authored
+// HTML plan is what dropped the page from the ledger (ox#1115).
+func saveEnrichedPlan(gitRoot string, in plan.Input, result plan.Result, authored []byte, options ...saveOpt) string {
+	if authored != nil {
+		return savePlanArtifacts(gitRoot, in, result, authored, plan.PrimaryHTML, options...)
+	}
+	return savePlanArtifacts(gitRoot, in, result, nil, "", options...)
 }
 
 // planLFSClient builds an LFS client for the project's ledger, or nil when one
@@ -419,7 +440,12 @@ func withCompanions(c []plan.CompanionFile) saveOpt {
 	return func(o *planSaveOpts) { o.companions = c }
 }
 
-// savePlanArtifacts is savePlanWithProvenance with an explicit primary artifact
+// savePlanArtifacts is the shared capture path: it stamps the plan with
+// provenance (session/agent/repo) + deterministic collaboration signals, writes
+// it to the ledger (read-merge preserving lifecycle), records the reverse link
+// on the live recording, and durably commits + pushes the plan dir. Returns the
+// saved directory, or "" on any failure (capture is best-effort and never
+// aborts the command the agent is waiting on). primary is the artifact
 // kind: "" = markdown-primary (html, if any, is a generated render), plan.
 // PrimaryHTML = the html IS the authored plan of record and in.Raw is the
 // DERIVED markdown (ExtractMarkdown). An HTML-primary page may declare its own
@@ -1166,7 +1192,9 @@ func writePlanJSON(cmd *cobra.Command, result plan.Result) error {
 // recommendation fires when EITHER team-context signals (Material) OR structural
 // substance (NonTrivial) warrant a human-review render — the same two axes the
 // ExitPlanMode nudge uses, so porcelain and hook stay consistent.
-func writePlanHuman(cmd *cobra.Command, result plan.Result, savedDir string) error {
+// pageSaved reports that savedDir holds the authored page as the plan of
+// record, so the advice must not ask for that page to be authored and saved.
+func writePlanHuman(cmd *cobra.Command, result plan.Result, savedDir string, pageSaved bool) error {
 	out := cmd.OutOrStdout()
 	s := result.Signals
 
@@ -1195,7 +1223,11 @@ func writePlanHuman(cmd *cobra.Command, result plan.Result, savedDir string) err
 		if s.Material {
 			lead = "Material signals found."
 		}
-		fmt.Fprintf(&b, "\n%s Author a visual `plan.html`, save it as canonical with `ox plan save --file plan.html`, and present it with `ox plan render --file plan.html --open`; keep exact edits in a closed Implementation notes appendix. Then start a live review loop with `ox plan review <slug>` — the human marks it up in the browser and the AI coworker receives it in-turn via `ox plan review await <slug>`, addressing each item live. `await` BLOCKS for feedback, so the coworker should confirm with the user before entering that loop (or use a short --timeout and poll).\n", lead)
+		next := "Author a visual `plan.html`, save it as canonical with `ox plan save --file plan.html`, and present it with `ox plan render --file plan.html --open`; keep exact edits in a closed Implementation notes appendix."
+		if pageSaved {
+			next = "The page is saved as the plan of record; present it with `ox plan render " + filepath.Base(savedDir) + " --open`."
+		}
+		fmt.Fprintf(&b, "\n%s %s Then start a live review loop with `ox plan review <slug>` — the human marks it up in the browser and the AI coworker receives it in-turn via `ox plan review await <slug>`, addressing each item live. `await` BLOCKS for feedback, so the coworker should confirm with the user before entering that loop (or use a short --timeout and poll).\n", lead, next)
 	}
 
 	fmt.Fprint(out, b.String())
